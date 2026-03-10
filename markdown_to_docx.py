@@ -137,7 +137,7 @@ class MarkdownToDocx:
                     continue
 
             # Bold (**текст**) - приоритет 2
-            if i < len(text) - 3 and text[i:i+2] == '**':
+            if i + 1 < len(text) and text[i:i+2] == '**':
                 end = text.find('**', i + 2)
                 if end != -1:
                     tokens.append(('bold', text[i+2:end]))
@@ -145,7 +145,7 @@ class MarkdownToDocx:
                     continue
 
             # Зачеркнат текст (~~текст~~) - приоритет 3
-            if i < len(text) - 3 and text[i:i+2] == '~~':
+            if i + 1 < len(text) and text[i:i+2] == '~~':
                 end = text.find('~~', i + 2)
                 if end != -1:
                     tokens.append(('strikethrough', text[i+2:end]))

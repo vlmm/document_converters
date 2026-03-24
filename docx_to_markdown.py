@@ -8,6 +8,16 @@ try:
 except ImportError:  # pragma: no cover - clear message if dependency missing
     Document = None  # type: ignore
 
+# Marker open/close tags in consistent application order:
+# bold → italic → underline → strikethrough
+_MARKER_ORDER = ["**", "_", "<u>", "~~"]
+_MARKER_OPEN = {"**": "**", "_": "_", "<u>": "<u>", "~~": "~~"}
+_MARKER_CLOSE = {"**": "**", "_": "_", "<u>": "</u>", "~~": "~~"}
+
+# One indent step: 0.5 inch in EMU (English Metric Units).
+# 914 400 EMU = 1 inch, so 0.5 inch ≈ 457 200 EMU.
+_INDENT_STEP_EMU = 457_200
+
 
 def _heading_level(style_name: str | None) -> int:
     """
@@ -29,17 +39,20 @@ def _heading_level(style_name: str | None) -> int:
 def _runs_to_markdown_text(runs) -> str:
     """
     Convert a sequence of docx runs to Markdown inline formatting.
-    Supports bold, italic, underline и зачертаване (strike-through).
 
-    Използваме state machine, за да:
-    - не слагаме отделни `**` за всеки run
-    - не „чупим“ bold/italic върху интервали и табове
+    Supports bold (**), italic (_), underline (<u>...</u>), and
+    strikethrough (~~).
+
+    Uses an ordered active-marker stack so that opening/closing order is
+    always consistent and nesting is valid when multiple styles toggle within
+    a paragraph.  When transitioning between run styles the function:
+      1. Closes markers (innermost first) that differ from the target set.
+      2. Opens the new markers that were not already open.
+    This avoids mis-nesting such as **_text**_ and ensures that combined
+    styles like bold+italic produce properly nested output (**_text_**).
     """
     result: list[str] = []
-    cur_bold = False
-    cur_italic = False
-    cur_underline = False
-    cur_strike = False
+    active: list[str] = []  # currently open markers, in opening order
 
     for r in runs:
         text = r.text or ""
@@ -51,82 +64,231 @@ def _runs_to_markdown_text(runs) -> str:
         target_underline = bool(getattr(r, "underline", False))
         target_strike = bool(getattr(getattr(r, "font", None), "strike", False))
 
-        # Затваряме маркери, които вече не са активни
-        if cur_underline and not target_underline:
-            result.append("</u>")
-            cur_underline = False
-        if cur_italic and not target_italic:
-            result.append("_")
-            cur_italic = False
-        if cur_bold and not target_bold:
-            result.append("**")
-            cur_bold = False
-        if cur_strike and not target_strike:
-            result.append("~~")
-            cur_strike = False
+        # Build the desired marker list in a fixed, consistent order.
+        target: list[str] = []
+        if target_bold:
+            target.append("**")
+        if target_italic:
+            target.append("_")
+        if target_underline:
+            target.append("<u>")
+        if target_strike:
+            target.append("~~")
 
-        # Отваряме нови маркери, които стават активни
-        if target_bold and not cur_bold:
-            result.append("**")
-            cur_bold = True
-        if target_italic and not cur_italic:
-            result.append("_")
-            cur_italic = True
-        if target_underline and not cur_underline:
-            result.append("<u>")
-            cur_underline = True
-        if target_strike and not cur_strike:
-            result.append("~~")
-            cur_strike = True
+        if active != target:
+            # Find how many leading markers are identical in both lists.
+            common_prefix = 0
+            for i in range(min(len(active), len(target))):
+                if active[i] == target[i]:
+                    common_prefix += 1
+                else:
+                    break
+
+            # Close markers from innermost (end of list) down to the split point.
+            for m in reversed(active[common_prefix:]):
+                result.append(_MARKER_CLOSE[m])
+
+            # Open new markers from the split point onwards.
+            for m in target[common_prefix:]:
+                result.append(_MARKER_OPEN[m])
+
+            active = target[:]
 
         result.append(text)
 
-    # Затваряме всичко останало в края на параграфа
-    if cur_underline:
-        result.append("</u>")
-    if cur_italic:
-        result.append("_")
-    if cur_bold:
-        result.append("**")
-    if cur_strike:
-        result.append("~~")
+    # Close all remaining open markers from innermost to outermost.
+    for m in reversed(active):
+        result.append(_MARKER_CLOSE[m])
 
     return "".join(result)
 
 
-def _is_list_paragraph(p) -> bool:
+def _get_list_info(p) -> tuple[bool, int, bool]:
     """
-    Heuristic: treat paragraphs with 'List Bullet' or 'List Number' styles as lists.
-    This does not inspect the underlying numbering XML, but works for common cases.
+    Return ``(is_list, nesting_level, is_numbered)`` for paragraph *p*.
+
+    Detection strategy (in priority order):
+    1. XML ``<w:numPr>`` element – most reliable; provides both the list flag
+       and the zero-based ``ilvl`` nesting level directly.
+    2. Style name heuristic (``List Bullet`` / ``List Number``) – fallback when
+       the paragraph has the right style but no explicit numbering XML (rare).
     """
     style_name = getattr(getattr(p, "style", None), "name", "") or ""
-    style_name = style_name.lower()
-    return "list bullet" in style_name or "list number" in style_name
+    style_lower = style_name.lower()
+    is_numbered_style = "list number" in style_lower
+    is_bullet_style = "list bullet" in style_lower
+
+    # --- primary: inspect numbering XML ---
+    try:
+        pPr = p._p.pPr  # paragraph properties element
+        if pPr is not None:
+            numPr = pPr.numPr  # numbering properties
+            if numPr is not None:
+                ilvl_elem = numPr.ilvl
+                ilvl_val = int(ilvl_elem.val) if ilvl_elem is not None else 0
+                numId_elem = numPr.numId
+                num_id_val = (
+                    int(numId_elem.val)
+                    if numId_elem is not None and numId_elem.val is not None
+                    else 0
+                )
+                if num_id_val > 0:
+                    # Full numbering definition present: use ilvl for nesting.
+                    return True, ilvl_val, is_numbered_style
+                if is_bullet_style or is_numbered_style:
+                    # numId absent but ilvl is set (e.g. via style-only list);
+                    # still use ilvl for the nesting level.
+                    return True, ilvl_val, is_numbered_style
+    except (AttributeError, Exception):
+        pass
+
+    # --- fallback: style name only, no numPr ---
+    if is_bullet_style or is_numbered_style:
+        level = _indent_level_from_paragraph(p)
+        return True, level, is_numbered_style
+
+    return False, 0, False
+
+
+def _indent_level_from_paragraph(p) -> int:
+    """Estimate nesting level from the paragraph's left indent (0.5 inch per level)."""
+    try:
+        left_indent = p.paragraph_format.left_indent
+        if left_indent is not None and left_indent > 0:
+            return max(0, int(left_indent) // _INDENT_STEP_EMU)
+    except (AttributeError, Exception):
+        pass
+    return 0
+
+
+def _get_paragraph_indent_level(p) -> int:
+    """
+    Return the indentation level for a *non-list* paragraph.
+    Both left_indent and first_line_indent are considered; the larger value wins.
+    Level 0 → no leading spaces; level N → 2*N leading spaces in the output.
+    """
+    try:
+        pf = p.paragraph_format
+        left_indent = pf.left_indent
+        first_line_indent = pf.first_line_indent
+
+        indent_emu = 0
+        if left_indent is not None and left_indent > 0:
+            indent_emu = max(indent_emu, int(left_indent))
+        if first_line_indent is not None and first_line_indent > 0:
+            indent_emu = max(indent_emu, int(first_line_indent))
+
+        if indent_emu > 0:
+            return max(0, indent_emu // _INDENT_STEP_EMU)
+    except (AttributeError, Exception):
+        pass
+    return 0
 
 
 def _normalize_marker_whitespace(text: str, marker: str) -> str:
     """
-    Нормализира whitespace около даден Markdown маркер (напр. ** или ~~):
-    - маха space/таб веднага след отварящия маркер
-    - маха space/таб точно преди затварящия маркер
-    - ако след затварящия маркер има символ, добавя интервал
+    Normalise whitespace around a Markdown marker (e.g. ** or ~~):
+    - strip space/tab immediately after an opening marker
+    - strip space/tab immediately before a closing marker
+    - insert a space after a closing marker when it is directly followed by a
+      non-space character
     """
     m = re.escape(marker)
-    # marker   textmarker -> markertextmarker
+    # **  text** -> **text**
     text = re.sub(rf"{m}[ \t]+(\S)", rf"{marker}\1", text)
-    # text   marker -> textmarker
+    # **text  ** -> **text**
     text = re.sub(rf"(\S)[ \t]+{m}", rf"\1{marker}", text)
-    # markertextmarkerX -> markertextmarker X
-    text = re.sub(rf"{m}([^{m}]+){m}(\S)", rf"{marker}\1{marker} \2", text)
+    # **text**X -> **text** X
+    # The negated character class uses the *first* character of the marker
+    # (e.g. '*' for '**', '~' for '~~') to avoid matching a span that itself
+    # contains the same marker characters.  This prevents the regex from
+    # accidentally consuming nested markers of the same type.
+    text = re.sub(rf"{m}([^{re.escape(marker[0])}]+){m}(\S)", rf"{marker}\1{marker} \2", text)
     return text
 
 
-def _list_marker(p) -> str:
-    style_name = getattr(getattr(p, "style", None), "name", "") or ""
-    style_name = style_name.lower()
-    if "number" in style_name:
-        return "1."
-    return "-"  # default bullet
+def _paragraph_to_md_line(p, in_table: bool = False) -> str:
+    """
+    Convert a single paragraph object to its Markdown line representation.
+
+    Handles:
+    - Inline formatting (bold, italic, underline, strikethrough).
+    - Bullet and numbered lists with nesting (``  -``, ``    -``, ...).
+    - Headings.
+    - Indented non-list paragraphs (leading spaces outside tables, or
+      ``&nbsp;`` sequences inside tables).
+    - Letter-clause paragraphs like ``(a)``, ``(b)`` are never converted to
+      list items.
+
+    Returns an empty string for empty/whitespace-only paragraphs.
+    """
+    text = _runs_to_markdown_text(p.runs)
+    text = _normalize_marker_whitespace(text, "**")
+    text = _normalize_marker_whitespace(text, "~~")
+
+    if not text:
+        return ""
+
+    # Letter clauses like (a), (b) – do not convert to list items.
+    # The \*{0,2} groups account for optional bold markers (**) that may wrap
+    # the clause when the run is bold-formatted.
+    is_letter_clause = bool(
+        re.match(r"^\s*\*{0,2}\(\s*[a-zA-Z]\s*\)\*{0,2}", text)
+    )
+
+    is_list, level, is_numbered = _get_list_info(p)
+
+    if is_list and not is_letter_clause:
+        indent = "  " * level
+        marker = "1." if is_numbered else "-"
+        return f"{indent}{marker} {text}"
+
+    # Heading paragraph.
+    head_level = _heading_level(getattr(getattr(p, "style", None), "name", None))
+    if head_level > 0:
+        return f"{'#' * head_level} {text}"
+
+    # Indented non-list paragraph.
+    indent_level = _get_paragraph_indent_level(p)
+    if indent_level > 0:
+        if in_table:
+            return "&nbsp;" * (2 * indent_level) + text
+        return "  " * indent_level + text
+
+    return text
+
+
+def _convert_cell_to_md(cell) -> str:
+    """
+    Convert a table cell to a single Markdown string.
+
+    - Each paragraph inside the cell is converted independently (including
+      list items and indentation).
+    - Multiple paragraphs are joined with ``<br>``.
+    - Leading spaces in each resulting line are replaced by ``&nbsp;``
+      sequences so that Markdown renderers preserve the indentation inside
+      the table cell.
+    """
+    lines: list[str] = []
+    for p in cell.paragraphs:
+        line = _paragraph_to_md_line(p, in_table=True)
+        if line:
+            lines.append(line)
+
+    if not lines:
+        return ""
+
+    # Replace leading ASCII spaces with &nbsp; so Markdown tables render them.
+    processed: list[str] = []
+    for line in lines:
+        stripped = line.lstrip(" ")
+        n_spaces = len(line) - len(stripped)
+        if n_spaces:
+            processed.append("&nbsp;" * n_spaces + stripped)
+        else:
+            processed.append(line)
+
+    return "<br>".join(processed)
 
 
 def docx_to_markdown(input_path: Path) -> str:
@@ -134,8 +296,10 @@ def docx_to_markdown(input_path: Path) -> str:
     Convert a .docx file to a Markdown string.
 
     Notes:
-    - Handles headings, bullet/numbered lists, and normal paragraphs.
-    - Tables and images are emitted as simple placeholders.
+    - Handles headings, bullet/numbered lists (with nesting), and normal
+      paragraphs.
+    - Tables are converted to Markdown pipe-tables; multi-paragraph cells are
+      joined with ``<br>`` and indentation is preserved via ``&nbsp;``.
     """
     if Document is None:
         raise RuntimeError(
@@ -153,7 +317,6 @@ def docx_to_markdown(input_path: Path) -> str:
     # We iterate over top-level block items in order: paragraphs and tables.
     # python-docx does not expose a high-level API for this, so we inspect
     # the document element tree.
-    from docx.document import Document as _DocType  # type: ignore
     from docx.table import Table  # type: ignore
     from docx.text.paragraph import Paragraph  # type: ignore
 
@@ -171,53 +334,34 @@ def docx_to_markdown(input_path: Path) -> str:
 
     for block in iter_block_items(doc):
         if isinstance(block, Paragraph):
-            text = _runs_to_markdown_text(block.runs)
-            # Нормализираме whitespace около основните inline маркери
-            text = _normalize_marker_whitespace(text, "**")
-            text = _normalize_marker_whitespace(text, "~~")
-            if not text:
-                # Preserve blank line
+            line = _paragraph_to_md_line(block)
+            if not line:
                 md_lines.append("")
                 continue
+            md_lines.append(line)
 
-            # Клауза от вида (a), (b) ... – да не я превръщаме в списък
-            is_letter_clause = bool(
-                re.match(r"^\s*\*{0,2}\(\s*[a-zA-Z]\s*\)\*{0,2}", text)
-            )
-
-            if _is_list_paragraph(block) and not is_letter_clause:
-                marker = _list_marker(block)
-                md_lines.append(f"{marker} {text}")
+        elif isinstance(block, Table):
+            rows = list(block.rows)
+            if not rows:
+                continue
+            header_cells = [_convert_cell_to_md(cell) for cell in rows[0].cells]
+            if any(header_cells):
+                md_lines.append("| " + " | ".join(header_cells) + " |")
+                md_lines.append(
+                    "| " + " | ".join("---" for _ in header_cells) + " |"
+                )
+                for row in rows[1:]:
+                    cells = [_convert_cell_to_md(cell) for cell in row.cells]
+                    md_lines.append("| " + " | ".join(cells) + " |")
             else:
-                level = _heading_level(getattr(getattr(block, "style", None), "name", None))
-                if level > 0:
-                    md_lines.append(f"{'#' * level} {text}")
-                else:
-                    md_lines.append(text)
+                # Fallback: emit as plain text rows
+                for row in rows:
+                    cells = [_convert_cell_to_md(cell) for cell in row.cells]
+                    md_lines.append(" | ".join(cells))
 
-        else:  # Table or other block
-            if isinstance(block, Table):
-                # Simple Markdown table conversion: first row as header if possible
-                rows = list(block.rows)
-                if not rows:
-                    continue
-                header_cells = [cell.text.strip() for cell in rows[0].cells]
-                if any(header_cells):
-                    md_lines.append("| " + " | ".join(header_cells) + " |")
-                    md_lines.append(
-                        "| " + " | ".join("---" for _ in header_cells) + " |"
-                    )
-                    for row in rows[1:]:
-                        cells = [cell.text.strip() for cell in row.cells]
-                        md_lines.append("| " + " | ".join(cells) + " |")
-                else:
-                    # Fallback: emit as plain text rows
-                    for row in rows:
-                        cells = [cell.text.strip() for cell in row.cells]
-                        md_lines.append(" | ".join(cells))
-            else:
-                # Unknown block type placeholder
-                md_lines.append("<!-- Unsupported block element -->")
+        else:
+            # Unknown block type placeholder
+            md_lines.append("<!-- Unsupported block element -->")
 
         # Add a blank line after each block for spacing
         if md_lines and md_lines[-1] != "":
@@ -262,4 +406,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

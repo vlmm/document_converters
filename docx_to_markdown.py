@@ -17,6 +17,23 @@ _INDENT_STEP_EMU = 457_200
 
 _PAGE_BREAK_MARKER = '<div style="page-break-after: always;"></div>'
 
+# Namespace map for WordprocessingML used by lxml xpath() calls.
+# Without this, expressions like .//w:br can raise: "Undefined namespace prefix".
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NS = {"w": _W_NS}
+
+def _xpath(el, expr: str):
+    """Run xpath with the WordprocessingML namespace map.
+
+    Some python-docx elements expose an lxml element with an xpath() method that
+    requires a namespace mapping when prefixes are used.
+    """
+
+    try:
+        return el.xpath(expr, namespaces=_NS)
+    except TypeError:
+        # Some xpath implementations don't accept the namespaces kwarg.
+        return el.xpath(expr)
 
 def _heading_level(style_name: str | None) -> int:
     if not style_name:
@@ -29,13 +46,12 @@ def _heading_level(style_name: str | None) -> int:
         return 1
     return 0
 
-
 def _paragraph_contains_page_break(p) -> bool:
     try:
-        return bool(p._p.xpath('.//w:br[@w:type="page"]'))
+        # Use explicit namespaces to avoid "Undefined namespace prefix".
+        return bool(_xpath(p._p, './/w:br[@w:type="page"]'))
     except Exception:
         return False
-
 
 def _runs_to_markdown_text(runs) -> str:
     result: list[str] = []
@@ -90,7 +106,6 @@ def _runs_to_markdown_text(runs) -> str:
 
     return "".join(result)
 
-
 def _indent_level_from_paragraph(p) -> int:
     try:
         left_indent = p.paragraph_format.left_indent
@@ -99,7 +114,6 @@ def _indent_level_from_paragraph(p) -> int:
     except (AttributeError, Exception):
         pass
     return 0
-
 
 def _get_paragraph_indent_level(p) -> int:
     try:
@@ -119,7 +133,6 @@ def _get_paragraph_indent_level(p) -> int:
         pass
     return 0
 
-
 def _normalize_marker_whitespace(text: str, marker: str) -> str:
     m = re.escape(marker)
     text = re.sub(rf"{m}[ \t]+(\S)", rf"{marker}\1", text)
@@ -130,7 +143,6 @@ def _normalize_marker_whitespace(text: str, marker: str) -> str:
         text,
     )
     return text
-
 
 def _int_to_roman(n: int, upper: bool = True) -> str:
     if n <= 0:
@@ -159,7 +171,6 @@ def _int_to_roman(n: int, upper: bool = True) -> str:
     res = "".join(out)
     return res if upper else res.lower()
 
-
 def _int_to_alpha(n: int, upper: bool = False) -> str:
     # 1 -> a, 26 -> z, 27 -> aa ...
     if n <= 0:
@@ -171,14 +182,11 @@ def _int_to_alpha(n: int, upper: bool = False) -> str:
         chars.append(chr(ord("A" if upper else "a") + (x % 26)))
         x //= 26
     return "".join(reversed(chars))
-
-
 @dataclass
 class _ListFormat:
     kind: str  # "decimal" | "upperRoman" | "lowerRoman" | "upperLetter" | "lowerLetter" | "bullet" | "unknown"
     lvl_text: str  # e.g. "%1." or "%1)"
     start: int = 1
-
 
 class _ListState:
     def __init__(self, formats: dict[tuple[int, int], _ListFormat]):
@@ -191,7 +199,7 @@ class _ListState:
             # fallback
             n = self.counters.get((num_id, ilvl), 0) + 1
             self.counters[(num_id, ilvl)] = n
-            return f"{n}."
+            return f"{n}.")
         if fmt.kind == "bullet":
             return "-"
         current = self.counters.get((num_id, ilvl))
@@ -221,7 +229,6 @@ class _ListState:
         marker = marker.strip()
         return marker
 
-
 def _extract_numpr(p) -> tuple[bool, int, int]:
     """Return (has_numpr, numId, ilvl)."""
     try:
@@ -238,7 +245,6 @@ def _extract_numpr(p) -> tuple[bool, int, int]:
         return True, num_id_val, ilvl_val
     except Exception:
         return False, 0, 0
-
 
 def _get_list_info(p) -> tuple[bool, int, bool, int, int]:
     """
@@ -259,7 +265,6 @@ def _get_list_info(p) -> tuple[bool, int, bool, int, int]:
 
     return False, 0, False, 0, 0
 
-
 def _build_list_formats(doc) -> dict[tuple[int, int], _ListFormat]:
     """
     Best-effort parse of numbering definitions for list marker formats.
@@ -272,15 +277,15 @@ def _build_list_formats(doc) -> dict[tuple[int, int], _ListFormat]:
 
     # Map abstractNumId -> {ilvl -> lvl element}
     abstract_lvls: dict[int, dict[int, object]] = {}
-    for abs_el in numbering.xpath("./w:abstractNum"):
+    for abs_el in _xpath(numbering, "./w:abstractNum"):
         try:
-            abs_id = int(abs_el.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}abstractNumId"))
+            abs_id = int(abs_el.get(f"{{{_W_NS}}}abstractNumId"))
         except Exception:
             continue
         lvl_map: dict[int, object] = {}
-        for lvl in abs_el.xpath("./w:lvl"):
+        for lvl in _xpath(abs_el, "./w:lvl"):
             try:
-                ilvl = int(lvl.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ilvl"))
+                ilvl = int(lvl.get(f"{{{_W_NS}}}ilvl"))
             except Exception:
                 continue
             lvl_map[ilvl] = lvl
@@ -291,28 +296,29 @@ def _build_list_formats(doc) -> dict[tuple[int, int], _ListFormat]:
     # numId overrides: (numId, ilvl) -> startOverride
     overrides_start: dict[tuple[int, int], int] = {}
 
-    for num in numbering.xpath("./w:num"):
+    for num in _xpath(numbering, "./w:num"):
         try:
-            num_id = int(num.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numId"))
+            num_id = int(num.get(f"{{{_W_NS}}}numId"))
         except Exception:
             continue
-        abs_ref = num.xpath("./w:abstractNumId")
+
+        abs_ref = _xpath(num, "./w:abstractNumId")
         if abs_ref:
             try:
-                abs_id = int(abs_ref[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val"))
+                abs_id = int(abs_ref[0].get(f"{{{_W_NS}}}val"))
                 num_to_abs[num_id] = abs_id
             except Exception:
                 pass
 
-        for lvl_override in num.xpath("./w:lvlOverride"):
+        for lvl_override in _xpath(num, "./w:lvlOverride"):
             try:
-                ilvl = int(lvl_override.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ilvl"))
+                ilvl = int(lvl_override.get(f"{{{_W_NS}}}ilvl"))
             except Exception:
                 continue
-            start_ov = lvl_override.xpath("./w:startOverride")
+            start_ov = _xpath(lvl_override, "./w:startOverride")
             if start_ov:
                 try:
-                    start_val = int(start_ov[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val"))
+                    start_val = int(start_ov[0].get(f"{{{_W_NS}}}val"))
                     overrides_start[(num_id, ilvl)] = start_val
                 except Exception:
                     pass
@@ -337,16 +343,16 @@ def _build_list_formats(doc) -> dict[tuple[int, int], _ListFormat]:
     for num_id, abs_id in num_to_abs.items():
         lvl_map = abstract_lvls.get(abs_id, {})
         for ilvl, lvl in lvl_map.items():
-            numfmt_el = lvl.xpath("./w:numFmt")
-            lvltext_el = lvl.xpath("./w:lvlText")
-            start_el = lvl.xpath("./w:start")
+            numfmt_el = _xpath(lvl, "./w:numFmt")
+            lvltext_el = _xpath(lvl, "./w:lvlText")
+            start_el = _xpath(lvl, "./w:start")
 
-            numfmt = numfmt_el[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val") if numfmt_el else ""
-            lvltext = lvltext_el[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val") if lvltext_el else "%1."
+            numfmt = numfmt_el[0].get(f"{{{_W_NS}}}val") if numfmt_el else ""
+            lvltext = lvltext_el[0].get(f"{{{_W_NS}}}val") if lvltext_el else "%1."
             start = 1
             if start_el:
                 try:
-                    start = int(start_el[0].get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val"))
+                    start = int(start_el[0].get(f"{{{_W_NS}}}val"))
                 except Exception:
                     start = 1
 
@@ -356,7 +362,6 @@ def _build_list_formats(doc) -> dict[tuple[int, int], _ListFormat]:
             formats[(num_id, ilvl)] = _ListFormat(kind=_kind_from_numfmt(numfmt), lvl_text=lvltext, start=start)
 
     return formats
-
 
 def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: bool = False) -> str:
     if _paragraph_contains_page_break(p):
@@ -410,7 +415,6 @@ def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: boo
 
     return text
 
-
 def _convert_cell_to_md(cell, list_state: _ListState | None = None) -> str:
     lines: list[str] = []
     for p in cell.paragraphs:
@@ -439,22 +443,19 @@ def _convert_cell_to_md(cell, list_state: _ListState | None = None) -> str:
 
     return "<br>".join(processed)
 
-
 def _table_row_cells(row) -> list:
     try:
-        tcs = row._tr.xpath("./w:tc")
+        tcs = _xpath(row._tr, "./w:tc")
         if tcs is not None:
             return [row.table._cell(tc, row._tr) for tc in tcs]
     except Exception:
         pass
     return list(row.cells)
 
-
 def docx_to_markdown(input_path: Path) -> str:
     if Document is None:
         raise RuntimeError(
-            "Missing dependency: python-docx.\n"
-            "Install it with: pip install python-docx"
+            "Missing dependency: python-docx.\n" "Install it with: pip install python-docx"
         )
 
     if not input_path.exists():
@@ -520,7 +521,6 @@ def docx_to_markdown(input_path: Path) -> str:
         md_lines.pop()
 
     return "\n".join(md_lines)
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Convert a .docx file to Markdown.")

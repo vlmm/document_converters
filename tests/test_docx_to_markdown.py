@@ -79,12 +79,14 @@ def _make_paragraph(
         pPr.numPr = numPr
         p._p = MagicMock()
         p._p.pPr = pPr
+        p._p.xpath.return_value = []
     else:
         # no numPr
         pPr = MagicMock()
         pPr.numPr = None
         p._p = MagicMock()
         p._p.pPr = pPr
+        p._p.xpath.return_value = []
 
     return p
 

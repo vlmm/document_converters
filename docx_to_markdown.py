@@ -1,13 +1,20 @@
 import argparse
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 try:
     from docx import Document  # type: ignore
 except ImportError:  # pragma: no cover - clear message if dependency missing
     Document = None  # type: ignore
+
+from utilities.docx_wml import (
+    ListFormat,
+    build_list_formats,
+    extract_numpr,
+    paragraph_contains_page_break,
+    xpath as _xpath,
+)
 
 _MARKER_ORDER = ["**", "_", "<u>", "~~"]
 _MARKER_OPEN = {"**": "**", "_": "_", "<u>": "<u>", "~~": "~~"}
@@ -16,24 +23,6 @@ _MARKER_CLOSE = {"**": "**", "_": "_", "<u>": "</u>", "~~": "~~"}
 _INDENT_STEP_EMU = 457_200
 
 _PAGE_BREAK_MARKER = '<div style="page-break-after: always;"></div>'
-
-# Namespace map for WordprocessingML used by lxml xpath() calls.
-# Without this, expressions like .//w:br can raise: "Undefined namespace prefix".
-_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-_NS = {"w": _W_NS}
-
-def _xpath(el, expr: str):
-    """Run xpath with the WordprocessingML namespace map.
-
-    Some python-docx elements expose an lxml element with an xpath() method that
-    requires a namespace mapping when prefixes are used.
-    """
-
-    try:
-        return el.xpath(expr, namespaces=_NS)
-    except TypeError:
-        # Some xpath implementations don't accept the namespaces kwarg.
-        return el.xpath(expr)
 
 def _heading_level(style_name: str | None) -> int:
     if not style_name:
@@ -45,13 +34,6 @@ def _heading_level(style_name: str | None) -> int:
                 return max(1, min(6, int(ch)))
         return 1
     return 0
-
-def _paragraph_contains_page_break(p) -> bool:
-    try:
-        # Use explicit namespaces to avoid "Undefined namespace prefix".
-        return bool(_xpath(p._p, './/w:br[@w:type="page"]'))
-    except Exception:
-        return False
 
 def _runs_to_markdown_text(runs) -> str:
     result: list[str] = []
@@ -182,14 +164,9 @@ def _int_to_alpha(n: int, upper: bool = False) -> str:
         chars.append(chr(ord("A" if upper else "a") + (x % 26)))
         x //= 26
     return "".join(reversed(chars))
-@dataclass
-class _ListFormat:
-    kind: str  # "decimal" | "upperRoman" | "lowerRoman" | "upperLetter" | "lowerLetter" | "bullet" | "unknown"
-    lvl_text: str  # e.g. "%1." or "%1)"
-    start: int = 1
 
 class _ListState:
-    def __init__(self, formats: dict[tuple[int, int], _ListFormat]):
+    def __init__(self, formats: dict[tuple[int, int], ListFormat]):
         self.formats = formats
         self.counters: dict[tuple[int, int], int] = {}
 
@@ -199,7 +176,7 @@ class _ListState:
             # fallback
             n = self.counters.get((num_id, ilvl), 0) + 1
             self.counters[(num_id, ilvl)] = n
-            return f"{n}.")
+            return f"{n}."
         if fmt.kind == "bullet":
             return "-"
         current = self.counters.get((num_id, ilvl))
@@ -229,142 +206,36 @@ class _ListState:
         marker = marker.strip()
         return marker
 
-def _extract_numpr(p) -> tuple[bool, int, int]:
-    """Return (has_numpr, numId, ilvl)."""
-    try:
-        pPr = p._p.pPr
-        if pPr is None or pPr.numPr is None:
-            return False, 0, 0
-        numPr = pPr.numPr
-        ilvl_elem = numPr.ilvl
-        ilvl_val = int(ilvl_elem.val) if ilvl_elem is not None and ilvl_elem.val is not None else 0
-        numId_elem = numPr.numId
-        num_id_val = int(numId_elem.val) if numId_elem is not None and numId_elem.val is not None else 0
-        if num_id_val <= 0:
-            return False, 0, 0
-        return True, num_id_val, ilvl_val
-    except Exception:
-        return False, 0, 0
-
-def _get_list_info(p) -> tuple[bool, int, bool, int, int]:
+def _get_list_info(p) -> tuple[bool, int, bool]:
     """
-    Return (is_list, nesting_level, is_numbered_style, numId, ilvl)
+    Return (is_list, nesting_level, is_numbered_style)
     """
     style_name = getattr(getattr(p, "style", None), "name", "") or ""
     style_lower = style_name.lower()
     is_numbered_style = "list number" in style_lower
     is_bullet_style = "list bullet" in style_lower
 
-    has_numpr, num_id, ilvl = _extract_numpr(p)
+    has_numpr, _num_id, ilvl = extract_numpr(p)
     if has_numpr:
-        return True, ilvl, is_numbered_style, num_id, ilvl
+        return True, ilvl, is_numbered_style
 
     if is_bullet_style or is_numbered_style:
+        # Try to read ilvl directly from XML (numId may be absent or 0)
+        try:
+            pPr = p._p.pPr
+            if pPr is not None and pPr.numPr is not None:
+                ilvl_elem = pPr.numPr.ilvl
+                if ilvl_elem is not None and ilvl_elem.val is not None:
+                    return True, int(ilvl_elem.val), is_numbered_style
+        except Exception:
+            pass
         level = _indent_level_from_paragraph(p)
-        return True, level, is_numbered_style, 0, level
+        return True, level, is_numbered_style
 
-    return False, 0, False, 0, 0
-
-def _build_list_formats(doc) -> dict[tuple[int, int], _ListFormat]:
-    """
-    Best-effort parse of numbering definitions for list marker formats.
-    """
-    formats: dict[tuple[int, int], _ListFormat] = {}
-    try:
-        numbering = doc.part.numbering_part.element  # CT_Numbering
-    except Exception:
-        return formats
-
-    # Map abstractNumId -> {ilvl -> lvl element}
-    abstract_lvls: dict[int, dict[int, object]] = {}
-    for abs_el in _xpath(numbering, "./w:abstractNum"):
-        try:
-            abs_id = int(abs_el.get(f"{{{_W_NS}}}abstractNumId"))
-        except Exception:
-            continue
-        lvl_map: dict[int, object] = {}
-        for lvl in _xpath(abs_el, "./w:lvl"):
-            try:
-                ilvl = int(lvl.get(f"{{{_W_NS}}}ilvl"))
-            except Exception:
-                continue
-            lvl_map[ilvl] = lvl
-        abstract_lvls[abs_id] = lvl_map
-
-    # numId -> abstractNumId
-    num_to_abs: dict[int, int] = {}
-    # numId overrides: (numId, ilvl) -> startOverride
-    overrides_start: dict[tuple[int, int], int] = {}
-
-    for num in _xpath(numbering, "./w:num"):
-        try:
-            num_id = int(num.get(f"{{{_W_NS}}}numId"))
-        except Exception:
-            continue
-
-        abs_ref = _xpath(num, "./w:abstractNumId")
-        if abs_ref:
-            try:
-                abs_id = int(abs_ref[0].get(f"{{{_W_NS}}}val"))
-                num_to_abs[num_id] = abs_id
-            except Exception:
-                pass
-
-        for lvl_override in _xpath(num, "./w:lvlOverride"):
-            try:
-                ilvl = int(lvl_override.get(f"{{{_W_NS}}}ilvl"))
-            except Exception:
-                continue
-            start_ov = _xpath(lvl_override, "./w:startOverride")
-            if start_ov:
-                try:
-                    start_val = int(start_ov[0].get(f"{{{_W_NS}}}val"))
-                    overrides_start[(num_id, ilvl)] = start_val
-                except Exception:
-                    pass
-
-    def _kind_from_numfmt(numfmt: str) -> str:
-        m = (numfmt or "").lower()
-        if m in ("decimal",):
-            return "decimal"
-        if m in ("upperroman",):
-            return "upperRoman"
-        if m in ("lowerroman",):
-            return "lowerRoman"
-        if m in ("upperletter", "upperalpha"):
-            return "upperLetter"
-        if m in ("lowerletter", "loweralpha"):
-            return "lowerLetter"
-        if m in ("bullet",):
-            return "bullet"
-        return "unknown"
-
-    # Build (numId, ilvl) -> ListFormat
-    for num_id, abs_id in num_to_abs.items():
-        lvl_map = abstract_lvls.get(abs_id, {})
-        for ilvl, lvl in lvl_map.items():
-            numfmt_el = _xpath(lvl, "./w:numFmt")
-            lvltext_el = _xpath(lvl, "./w:lvlText")
-            start_el = _xpath(lvl, "./w:start")
-
-            numfmt = numfmt_el[0].get(f"{{{_W_NS}}}val") if numfmt_el else ""
-            lvltext = lvltext_el[0].get(f"{{{_W_NS}}}val") if lvltext_el else "%1."
-            start = 1
-            if start_el:
-                try:
-                    start = int(start_el[0].get(f"{{{_W_NS}}}val"))
-                except Exception:
-                    start = 1
-
-            if (num_id, ilvl) in overrides_start:
-                start = overrides_start[(num_id, ilvl)]
-
-            formats[(num_id, ilvl)] = _ListFormat(kind=_kind_from_numfmt(numfmt), lvl_text=lvltext, start=start)
-
-    return formats
+    return False, 0, False
 
 def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: bool = False) -> str:
-    if _paragraph_contains_page_break(p):
+    if paragraph_contains_page_break(p):
         return _PAGE_BREAK_MARKER
 
     text = _runs_to_markdown_text(p.runs)
@@ -376,7 +247,8 @@ def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: boo
 
     is_letter_clause = bool(re.match(r"^\s*\*{0,2}\(\s*[a-zA-Z]\s*\)\*{0,2}", text))
 
-    is_list, level, is_numbered_style, num_id, ilvl = _get_list_info(p)
+    is_list, level, is_numbered_style = _get_list_info(p)
+    _has_numpr, num_id, ilvl = extract_numpr(p)
 
     if is_list and not is_letter_clause:
         indent = "  " * level
@@ -387,7 +259,7 @@ def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: boo
             return f"{indent}{marker} {text}"
 
         # Numbered/bulleted list from numbering definitions
-        marker = "1."
+        marker = "-" if not is_numbered_style else "1."
         if list_state is not None:
             marker = list_state.next_marker(num_id, ilvl)
 
@@ -419,9 +291,7 @@ def _convert_cell_to_md(cell, list_state: _ListState | None = None) -> str:
     lines: list[str] = []
     for p in cell.paragraphs:
         line = _paragraph_to_md_line(p, list_state=list_state, in_table=True)
-        if line == "":
-            lines.append("")
-        else:
+        if line:
             lines.append(line)
 
     if not lines:
@@ -429,9 +299,6 @@ def _convert_cell_to_md(cell, list_state: _ListState | None = None) -> str:
 
     processed: list[str] = []
     for line in lines:
-        if line == "":
-            processed.append("")
-            continue
         stripped = line.lstrip(" ")
         n_spaces = len(line) - len(stripped)
         if n_spaces:
@@ -463,7 +330,7 @@ def docx_to_markdown(input_path: Path) -> str:
 
     doc = Document(str(input_path))
 
-    list_formats = _build_list_formats(doc)
+    list_formats = build_list_formats(doc)
     list_state = _ListState(list_formats)
 
     md_lines: list[str] = []

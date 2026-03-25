@@ -26,6 +26,7 @@ from docx_to_markdown import (
     _get_paragraph_indent_level,
     _paragraph_to_md_line,
     _convert_cell_to_md,
+    _table_row_cells,
     docx_to_markdown,
 )
 
@@ -33,8 +34,12 @@ from docx_to_markdown import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_run(text: str, bold=False, italic=False, underline=False, strike=False):
-    """Create a minimal mock run object."""
+def _make_run(text: str, bold=False, italic=False, underline=False, strike=False, color_rgb=None):
+    """Create a minimal mock run object.
+
+    ``color_rgb`` may be a hex string like ``"FF0000"`` for an explicit color,
+    or ``None`` (default) to represent the automatic/default black color.
+    """
     run = MagicMock()
     run.text = text
     run.bold = bold
@@ -42,6 +47,10 @@ def _make_run(text: str, bold=False, italic=False, underline=False, strike=False
     run.underline = underline
     run.font = MagicMock()
     run.font.strike = strike
+    run.font.color = MagicMock()
+    run.font.color.rgb = color_rgb
+    # .type mirrors the python-docx ColorFormat API (None = auto/inherit).
+    run.font.color.type = None if color_rgb is None else "explicit"
     return run
 
 
@@ -577,6 +586,181 @@ class TestEndToEnd(unittest.TestCase):
         p.paragraph_format.left_indent = Inches(0.5)
         result = self._convert(doc)
         self.assertIn("&nbsp;", result)
+
+    def test_e2e_table_horizontal_merge_no_duplicate_columns(self):
+        """Horizontally merged cells must not produce duplicate columns."""
+        doc = DocxDocument()
+        table = doc.add_table(rows=2, cols=3)
+        # Merge first two columns in header row
+        table.rows[0].cells[0].merge(table.rows[0].cells[1])
+        table.rows[0].cells[0].paragraphs[0].add_run("Merged")
+        table.rows[0].cells[2].paragraphs[0].add_run("Col3")
+        table.rows[1].cells[0].paragraphs[0].add_run("A")
+        table.rows[1].cells[1].paragraphs[0].add_run("B")
+        table.rows[1].cells[2].paragraphs[0].add_run("C")
+        result = self._convert(doc)
+        lines = result.splitlines()
+        # Find the header row (contains "Merged")
+        header_lines = [l for l in lines if "Merged" in l]
+        self.assertEqual(len(header_lines), 1, f"Expected one header line, got: {header_lines}")
+        header_line = header_lines[0]
+        # After deduplication the merged cell appears once: 2 unique columns → 3 pipe chars
+        col_count = header_line.count("|") - 1
+        self.assertEqual(col_count, 2, f"Expected 2 columns after merge, got {col_count}: {header_line!r}")
+
+    def test_e2e_italic_non_black(self):
+        """--italic-non-black: colored runs are wrapped in _..._."""
+        doc = DocxDocument()
+        from docx.shared import RGBColor  # type: ignore
+        p = doc.add_paragraph()
+        r = p.add_run("colored")
+        r.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)  # red
+        result = self._convert_with_flag(doc, italic_non_black=True)
+        self.assertIn("_colored_", result)
+
+    def test_e2e_italic_non_black_black_unchanged(self):
+        """--italic-non-black: explicit black text must NOT become italic."""
+        doc = DocxDocument()
+        from docx.shared import RGBColor  # type: ignore
+        p = doc.add_paragraph()
+        r = p.add_run("black")
+        r.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        result = self._convert_with_flag(doc, italic_non_black=True)
+        self.assertNotIn("_black_", result)
+        self.assertIn("black", result)
+
+    def test_e2e_italic_non_black_auto_unchanged(self):
+        """--italic-non-black: auto-color text (no explicit color) must NOT become italic."""
+        doc = DocxDocument()
+        p = doc.add_paragraph()
+        p.add_run("auto")  # no color set → auto/black
+        result = self._convert_with_flag(doc, italic_non_black=True)
+        self.assertNotIn("_auto_", result)
+
+    def test_e2e_italic_non_black_flag_off(self):
+        """Without --italic-non-black, colored text is NOT italicized."""
+        doc = DocxDocument()
+        from docx.shared import RGBColor  # type: ignore
+        p = doc.add_paragraph()
+        r = p.add_run("colored")
+        r.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+        result = self._convert_with_flag(doc, italic_non_black=False)
+        self.assertNotIn("_colored_", result)
+        self.assertIn("colored", result)
+
+    def _convert_with_flag(self, doc, italic_non_black: bool = False):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as f:
+            tmp = Path(f.name)
+        try:
+            doc.save(str(tmp))
+            return docx_to_markdown(tmp, italic_non_black=italic_non_black)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 6. _table_row_cells deduplication
+# ---------------------------------------------------------------------------
+
+class TestTableRowCells(unittest.TestCase):
+
+    def _make_cell(self, tc):
+        cell = MagicMock()
+        cell._tc = tc
+        return cell
+
+    def test_deduplicates_horizontally_merged_cells(self):
+        """row.cells returning the same cell twice must yield only one entry."""
+        tc1 = MagicMock(name="tc1")
+        tc2 = MagicMock(name="tc2")
+        cell1 = self._make_cell(tc1)
+        cell2 = self._make_cell(tc2)
+
+        row = MagicMock()
+        # cell1 repeated (horizontal merge spanning 2 columns)
+        row.cells = (cell1, cell1, cell2)
+
+        result = _table_row_cells(row)
+        self.assertEqual(len(result), 2)
+        self.assertIs(result[0], cell1)
+        self.assertIs(result[1], cell2)
+
+    def test_no_merge_returns_all_cells(self):
+        """Rows without merges must return all cells unchanged."""
+        tc1, tc2, tc3 = MagicMock(), MagicMock(), MagicMock()
+        cell1 = self._make_cell(tc1)
+        cell2 = self._make_cell(tc2)
+        cell3 = self._make_cell(tc3)
+
+        row = MagicMock()
+        row.cells = (cell1, cell2, cell3)
+
+        result = _table_row_cells(row)
+        self.assertEqual(result, [cell1, cell2, cell3])
+
+    def test_all_same_cell_returns_one(self):
+        """Extreme case: entire row is one merged cell."""
+        tc = MagicMock(name="tc")
+        cell = self._make_cell(tc)
+
+        row = MagicMock()
+        row.cells = (cell, cell, cell)
+
+        result = _table_row_cells(row)
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], cell)
+
+
+# ---------------------------------------------------------------------------
+# 7. _is_non_black_color and italic_non_black flag
+# ---------------------------------------------------------------------------
+
+class TestItalicNonBlack(unittest.TestCase):
+
+    def test_non_black_color_makes_italic(self):
+        run = _make_run("red", color_rgb="FF0000")
+        result = _runs_to_markdown_text([run], italic_non_black=True)
+        self.assertIn("_red_", result)
+
+    def test_explicit_black_not_italic(self):
+        run = _make_run("black", color_rgb="000000")
+        result = _runs_to_markdown_text([run], italic_non_black=True)
+        self.assertEqual(result, "black")
+
+    def test_auto_color_not_italic(self):
+        run = _make_run("auto", color_rgb=None)
+        result = _runs_to_markdown_text([run], italic_non_black=True)
+        self.assertEqual(result, "auto")
+
+    def test_flag_off_no_italic(self):
+        run = _make_run("red", color_rgb="FF0000")
+        result = _runs_to_markdown_text([run], italic_non_black=False)
+        self.assertEqual(result, "red")
+
+    def test_already_italic_plus_non_black_stays_italic(self):
+        """Run that is already italic + non-black color: no double _."""
+        run = _make_run("red+italic", italic=True, color_rgb="FF0000")
+        result = _runs_to_markdown_text([run], italic_non_black=True)
+        self.assertEqual(result, "_red+italic_")
+
+    def test_non_black_combined_with_bold(self):
+        """Non-black color + bold → bold italic."""
+        run = _make_run("bi", bold=True, color_rgb="FF0000")
+        result = _runs_to_markdown_text([run], italic_non_black=True)
+        self.assertIn("**", result)
+        self.assertIn("_", result)
+        self.assertIn("bi", result)
+
+    def test_color_exception_not_italic(self):
+        """If color access raises, treat as black (no italic)."""
+        from unittest.mock import PropertyMock
+        run = _make_run("safe")
+        run.font.color = MagicMock()
+        # Make .rgb property itself raise when accessed
+        type(run.font.color).rgb = PropertyMock(side_effect=Exception("no color"))
+        result = _runs_to_markdown_text([run], italic_non_black=True)
+        self.assertEqual(result, "safe")
 
 
 if __name__ == "__main__":

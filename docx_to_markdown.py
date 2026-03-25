@@ -35,7 +35,30 @@ def _heading_level(style_name: str | None) -> int:
         return 1
     return 0
 
-def _runs_to_markdown_text(runs) -> str:
+def _is_non_black_color(r) -> bool:
+    """Return True if the run has an explicit non-black color.
+
+    Auto/default color (None rgb) and explicit black (#000000) are treated as
+    black.  Any other explicit RGB color is considered non-black.
+    """
+    try:
+        color = getattr(getattr(r, "font", None), "color", None)
+        if color is None:
+            return False
+        rgb = color.rgb
+        if rgb is None:
+            return False
+        # python-docx RGBColor is an int subclass; 0 == #000000.
+        # Fall back to string comparison for other representations.
+        try:
+            return int(rgb) != 0
+        except (TypeError, ValueError):
+            return str(rgb).upper() != "000000"
+    except Exception:
+        return False
+
+
+def _runs_to_markdown_text(runs, italic_non_black: bool = False) -> str:
     result: list[str] = []
     active: list[str] = []  # currently open markers, in opening order
 
@@ -51,7 +74,9 @@ def _runs_to_markdown_text(runs) -> str:
             text = "<br>".join(parts)
 
         target_bold = bool(getattr(r, "bold", False))
-        target_italic = bool(getattr(r, "italic", False))
+        target_italic = bool(getattr(r, "italic", False)) or (
+            italic_non_black and _is_non_black_color(r)
+        )
         target_underline = bool(getattr(r, "underline", False))
         target_strike = bool(getattr(getattr(r, "font", None), "strike", False))
 
@@ -234,11 +259,16 @@ def _get_list_info(p) -> tuple[bool, int, bool]:
 
     return False, 0, False
 
-def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: bool = False) -> str:
+def _paragraph_to_md_line(
+    p,
+    list_state: _ListState | None = None,
+    in_table: bool = False,
+    italic_non_black: bool = False,
+) -> str:
     if paragraph_contains_page_break(p):
         return _PAGE_BREAK_MARKER
 
-    text = _runs_to_markdown_text(p.runs)
+    text = _runs_to_markdown_text(p.runs, italic_non_black=italic_non_black)
     text = _normalize_marker_whitespace(text, "**")
     text = _normalize_marker_whitespace(text, "~~")
 
@@ -287,10 +317,14 @@ def _paragraph_to_md_line(p, list_state: _ListState | None = None, in_table: boo
 
     return text
 
-def _convert_cell_to_md(cell, list_state: _ListState | None = None) -> str:
+def _convert_cell_to_md(
+    cell, list_state: _ListState | None = None, italic_non_black: bool = False
+) -> str:
     lines: list[str] = []
     for p in cell.paragraphs:
-        line = _paragraph_to_md_line(p, list_state=list_state, in_table=True)
+        line = _paragraph_to_md_line(
+            p, list_state=list_state, in_table=True, italic_non_black=italic_non_black
+        )
         if line:
             lines.append(line)
 
@@ -311,15 +345,23 @@ def _convert_cell_to_md(cell, list_state: _ListState | None = None) -> str:
     return "<br>".join(processed)
 
 def _table_row_cells(row) -> list:
-    try:
-        tcs = _xpath(row._tr, "./w:tc")
-        if tcs is not None:
-            return [row.table._cell(tc, row._tr) for tc in tcs]
-    except Exception:
-        pass
-    return list(row.cells)
+    """Return unique cells for a table row, skipping merged-cell duplicates.
 
-def docx_to_markdown(input_path: Path) -> str:
+    python-docx's ``row.cells`` returns the same ``_Cell`` object for every
+    grid column that a merged cell occupies (both horizontal and vertical
+    merges).  By comparing the underlying ``w:tc`` XML elements we can filter
+    duplicates and return each logical cell exactly once.
+    """
+    seen: set[int] = set()
+    result = []
+    for cell in row.cells:
+        tc_id = id(cell._tc)
+        if tc_id not in seen:
+            seen.add(tc_id)
+            result.append(cell)
+    return result
+
+def docx_to_markdown(input_path: Path, italic_non_black: bool = False) -> str:
     if Document is None:
         raise RuntimeError(
             "Missing dependency: python-docx.\n" "Install it with: pip install python-docx"
@@ -348,7 +390,9 @@ def docx_to_markdown(input_path: Path) -> str:
 
     for block in iter_block_items(doc):
         if isinstance(block, Paragraph):
-            line = _paragraph_to_md_line(block, list_state=list_state)
+            line = _paragraph_to_md_line(
+                block, list_state=list_state, italic_non_black=italic_non_black
+            )
             if not line:
                 md_lines.append("")
                 continue
@@ -360,13 +404,25 @@ def docx_to_markdown(input_path: Path) -> str:
                 continue
 
             header_row_cells = _table_row_cells(rows[0])
-            header_cells = [_convert_cell_to_md(cell, list_state=list_state) for cell in header_row_cells]
+            header_cells = [
+                _convert_cell_to_md(
+                    cell, list_state=list_state, italic_non_black=italic_non_black
+                )
+                for cell in header_row_cells
+            ]
             if any(header_cells):
                 md_lines.append("| " + " | ".join(header_cells) + " |")
                 md_lines.append("| " + " | ".join("---" for _ in header_cells) + " |")
                 for row in rows[1:]:
                     row_cells = _table_row_cells(row)
-                    cells = [_convert_cell_to_md(cell, list_state=list_state) for cell in row_cells]
+                    cells = [
+                        _convert_cell_to_md(
+                            cell,
+                            list_state=list_state,
+                            italic_non_black=italic_non_black,
+                        )
+                        for cell in row_cells
+                    ]
                     if len(cells) < len(header_cells):
                         cells.extend([""] * (len(header_cells) - len(cells)))
                     elif len(cells) > len(header_cells):
@@ -375,7 +431,14 @@ def docx_to_markdown(input_path: Path) -> str:
             else:
                 for row in rows:
                     row_cells = _table_row_cells(row)
-                    cells = [_convert_cell_to_md(cell, list_state=list_state) for cell in row_cells]
+                    cells = [
+                        _convert_cell_to_md(
+                            cell,
+                            list_state=list_state,
+                            italic_non_black=italic_non_black,
+                        )
+                        for cell in row_cells
+                    ]
                     md_lines.append(" | ".join(cells))
 
         else:
@@ -397,6 +460,16 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         help="Path to output .md file (default: same name with .md extension)",
     )
+    parser.add_argument(
+        "--italic-non-black",
+        action="store_true",
+        default=False,
+        help=(
+            "Wrap any run whose text color is not black (and not the default/auto color) "
+            "in Markdown italic markers (_..._).  Black is defined as explicit #000000 or "
+            "the document default (auto) color."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -407,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path = input_path.with_suffix(".md")
 
     try:
-        md = docx_to_markdown(input_path)
+        md = docx_to_markdown(input_path, italic_non_black=args.italic_non_black)
     except Exception as exc:  # pragma: no cover - CLI error path
         sys.stderr.write(f"Error: {exc}\n")
         return 1

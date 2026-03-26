@@ -3,7 +3,7 @@ import os
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from markdown_to_docx import MarkdownToDocx
+from markdown_to_docx import MarkdownToDocx, _parse_color
 
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.oxml.ns import qn
@@ -213,16 +213,16 @@ class TestTableBorders(unittest.TestCase):
             return None
         return tblPr.find(qn('w:tblBorders'))
 
-    def test_default_borders_are_black(self):
-        """By default (table_borders=True) the table must have black single-line borders."""
-        converter = MarkdownToDocx(table_borders=True)
+    def test_default_border_color_is_gray(self):
+        """By default the table must have single-line gray (808080) borders."""
+        converter = MarkdownToDocx()
         doc = converter.convert(self.TABLE)
         borders = self._get_tbl_borders(doc)
         self.assertIsNotNone(borders, "w:tblBorders element must be present")
         top = borders.find(qn('w:top'))
         self.assertIsNotNone(top)
         self.assertEqual(top.get(qn('w:val')), 'single')
-        self.assertEqual(top.get(qn('w:color')).upper(), '000000')
+        self.assertEqual(top.get(qn('w:color')).upper(), '808080')
 
     def test_no_borders_flag_removes_visible_borders(self):
         """With table_borders=False every border side must be 'none'."""
@@ -244,13 +244,98 @@ class TestTableBorders(unittest.TestCase):
             self.assertIsNotNone(borders.find(qn(side)), f"{side} must be present")
 
     def test_default_constructor_has_borders(self):
-        """MarkdownToDocx() with no arguments defaults to table_borders=True."""
+        """MarkdownToDocx() with no arguments defaults to single-line borders."""
         converter = MarkdownToDocx()
         doc = converter.convert(self.TABLE)
         borders = self._get_tbl_borders(doc)
         self.assertIsNotNone(borders)
         top = borders.find(qn('w:top'))
         self.assertEqual(top.get(qn('w:val')), 'single')
+
+    def test_custom_border_color_hex(self):
+        """A custom hex color is applied to all six border sides."""
+        converter = MarkdownToDocx(table_border_color='FF0000')
+        doc = converter.convert(self.TABLE)
+        borders = self._get_tbl_borders(doc)
+        for side in ('w:top', 'w:left', 'w:bottom', 'w:right', 'w:insideH', 'w:insideV'):
+            el = borders.find(qn(side))
+            self.assertEqual(el.get(qn('w:color')).upper(), 'FF0000',
+                             f"{side} color must be FF0000")
+
+    def test_custom_border_color_rgb(self):
+        """A custom R,G,B color string is correctly converted and applied."""
+        converter = MarkdownToDocx(table_border_color='0,0,255')
+        doc = converter.convert(self.TABLE)
+        borders = self._get_tbl_borders(doc)
+        top = borders.find(qn('w:top'))
+        self.assertEqual(top.get(qn('w:color')).upper(), '0000FF')
+
+
+class TestParseColor(unittest.TestCase):
+    def test_hex_lowercase(self):
+        self.assertEqual(_parse_color('808080'), '808080')
+
+    def test_hex_uppercase(self):
+        self.assertEqual(_parse_color('FF0000'), 'FF0000')
+
+    def test_hex_with_hash(self):
+        self.assertEqual(_parse_color('#0000ff'), '0000FF')
+
+    def test_rgb_integers(self):
+        self.assertEqual(_parse_color('128,128,128'), '808080')
+
+    def test_rgb_black(self):
+        self.assertEqual(_parse_color('0,0,0'), '000000')
+
+    def test_rgb_white(self):
+        self.assertEqual(_parse_color('255,255,255'), 'FFFFFF')
+
+    def test_invalid_hex_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_color('ZZZZZZ')
+
+    def test_invalid_rgb_range_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_color('256,0,0')
+
+    def test_invalid_rgb_count_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_color('1,2')
+
+
+class TestNoPreferredWidths(unittest.TestCase):
+    TABLE = "| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |"
+
+    def _get_table(self, md: str):
+        converter = MarkdownToDocx()
+        doc = converter.convert(md)
+        return doc.tables[0]
+
+    def test_no_table_preferred_width(self):
+        """w:tblW must not be present in w:tblPr."""
+        table = self._get_table(self.TABLE)
+        tblPr = table._element.find(qn('w:tblPr'))
+        if tblPr is not None:
+            self.assertIsNone(tblPr.find(qn('w:tblW')),
+                              "w:tblW (table preferred width) must not be set")
+
+    def test_no_column_preferred_width(self):
+        """w:gridCol elements must not carry a w:w attribute."""
+        table = self._get_table(self.TABLE)
+        tblGrid = table._element.find(qn('w:tblGrid'))
+        if tblGrid is not None:
+            for gridCol in tblGrid.findall(qn('w:gridCol')):
+                self.assertNotIn(qn('w:w'), gridCol.attrib,
+                                 "w:gridCol must not have a w:w attribute (column preferred width)")
+
+    def test_no_cell_preferred_width(self):
+        """w:tcW must not be present inside any cell's w:tcPr."""
+        table = self._get_table(self.TABLE)
+        for tc in table._element.iter(qn('w:tc')):
+            tcPr = tc.find(qn('w:tcPr'))
+            if tcPr is not None:
+                self.assertIsNone(tcPr.find(qn('w:tcW')),
+                                  "w:tcW (cell preferred width) must not be set")
 
 
 if __name__ == "__main__":

@@ -17,18 +17,44 @@ _TABLE_SEPARATOR_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
 )
 
-# Border width (in eighths of a point) and spacing used for table borders.
+# Border width (in eighths of a point), spacing, and default color for table borders.
 _TABLE_BORDER_SZ = 4
 _TABLE_BORDER_SPACE = 0
+_TABLE_BORDER_COLOR = "808080"  # RGB 128, 128, 128
+
+
+def _parse_color(color_str: str) -> str:
+    """Parse *color_str* to a 6-character uppercase hex string (e.g. ``'808080'``).
+
+    Accepted formats:
+    - Hex string: ``'808080'`` or ``'#808080'``
+    - RGB triple: ``'128,128,128'``
+    """
+    s = color_str.strip().lstrip('#')
+    if ',' in s:
+        parts = s.split(',')
+        if len(parts) != 3:
+            raise ValueError(f"Invalid RGB color '{color_str}': expected 3 comma-separated integers")
+        r, g, b = (int(p.strip()) for p in parts)
+        for name, val in (('R', r), ('G', g), ('B', b)):
+            if not 0 <= val <= 255:
+                raise ValueError(f"RGB component {name}={val} out of range 0-255")
+        return f"{r:02X}{g:02X}{b:02X}"
+    if len(s) == 6 and all(c in '0123456789abcdefABCDEF' for c in s):
+        return s.upper()
+    raise ValueError(
+        f"Invalid color '{color_str}': use a 6-digit hex string or 'R,G,B' integers"
+    )
 
 
 class MarkdownToDocx:
-    def __init__(self, table_borders: bool = True):
+    def __init__(self, table_borders: bool = True, table_border_color: str = _TABLE_BORDER_COLOR):
         self.doc = Document()
         self.in_code_block = False
         self.code_block_lines = []
         self.table_buffer: List[str] = []
         self.table_borders = table_borders
+        self.table_border_color = _parse_color(table_border_color)
 
     def convert(self, markdown_text: str) -> Document:
         """Конвертира markdown текст в DOCX документ"""
@@ -202,7 +228,8 @@ class MarkdownToDocx:
         }
 
         table = self.doc.add_table(rows=len(all_rows), cols=num_cols)
-        self._set_table_borders(table, self.table_borders)
+        self._remove_preferred_widths(table)
+        self._set_table_borders(table, self.table_borders, self.table_border_color)
 
         for r_idx, row_cells in enumerate(all_rows):
             # Pad short rows
@@ -220,15 +247,15 @@ class MarkdownToDocx:
                 )
 
     @staticmethod
-    def _set_table_borders(table, visible: bool):
-        """Apply black single-line borders (visible=True) or no borders (visible=False)."""
+    def _set_table_borders(table, visible: bool, color: str = _TABLE_BORDER_COLOR):
+        """Apply single-line borders in *color* (visible=True) or no borders (visible=False)."""
         from docx.oxml import parse_xml
         from docx.oxml.ns import qn
 
         ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
         if visible:
             b = (f'w:val="single" w:sz="{_TABLE_BORDER_SZ}" '
-                 f'w:space="{_TABLE_BORDER_SPACE}" w:color="000000"')
+                 f'w:space="{_TABLE_BORDER_SPACE}" w:color="{color}"')
         else:
             b = (f'w:val="none" w:sz="0" '
                  f'w:space="{_TABLE_BORDER_SPACE}" w:color="auto"')
@@ -250,6 +277,39 @@ class MarkdownToDocx:
         if existing is not None:
             tblPr.remove(existing)
         tblPr.append(borders_elm)
+
+    @staticmethod
+    def _remove_preferred_widths(table):
+        """Remove table-level, column-level and cell-level preferred-width settings.
+
+        python-docx may write ``w:tblW`` on the table properties, ``w:w`` on
+        each ``w:gridCol``, and ``w:tcW`` on each cell's ``w:tcPr``.  Removing
+        these lets Word calculate column widths automatically.
+        """
+        from docx.oxml.ns import qn
+
+        # Table preferred width
+        tblPr = table._element.find(qn('w:tblPr'))
+        if tblPr is not None:
+            tblW = tblPr.find(qn('w:tblW'))
+            if tblW is not None:
+                tblPr.remove(tblW)
+
+        # Column preferred widths in tblGrid
+        tblGrid = table._element.find(qn('w:tblGrid'))
+        if tblGrid is not None:
+            for gridCol in tblGrid.findall(qn('w:gridCol')):
+                attrib_key = qn('w:w')
+                if attrib_key in gridCol.attrib:
+                    del gridCol.attrib[attrib_key]
+
+        # Cell preferred widths
+        for tc in table._element.iter(qn('w:tc')):
+            tcPr = tc.find(qn('w:tcPr'))
+            if tcPr is not None:
+                tcW = tcPr.find(qn('w:tcW'))
+                if tcW is not None:
+                    tcPr.remove(tcW)
 
     def _add_heading(self, text: str, level: int):
         """Добавя заглавие"""
@@ -382,14 +442,18 @@ class MarkdownToDocx:
         self.doc.save(filename)
 
 
-def markdown_to_docx(markdown_text: str, output_filename: str, table_borders: bool = True):
+def markdown_to_docx(markdown_text: str, output_filename: str,
+                     table_borders: bool = True,
+                     table_border_color: str = _TABLE_BORDER_COLOR):
     """Простна функция за конвертиране на markdown в docx"""
-    converter = MarkdownToDocx(table_borders=table_borders)
+    converter = MarkdownToDocx(table_borders=table_borders, table_border_color=table_border_color)
     doc = converter.convert(markdown_text)
     converter.save(output_filename)
 
 
-def convert_file(input_file: str, output_file: str = None, table_borders: bool = True):
+def convert_file(input_file: str, output_file: str = None,
+                 table_borders: bool = True,
+                 table_border_color: str = _TABLE_BORDER_COLOR):
     """Конвертира markdown файл в docx файл"""
 
     # Проверка дали входния файл съществува
@@ -415,7 +479,9 @@ def convert_file(input_file: str, output_file: str = None, table_borders: bool =
 
         # Конвертиране
         print(f"⏳ Конвертиране на markdown в docx...")
-        markdown_to_docx(markdown_content, output_file, table_borders=table_borders)
+        markdown_to_docx(markdown_content, output_file,
+                         table_borders=table_borders,
+                         table_border_color=table_border_color)
 
         print(f"✅ Успешно! Документ създаден: {output_file}")
         return True
@@ -436,6 +502,8 @@ def main():
   python markdown_to_docx.py README.md -o output.docx
   python markdown_to_docx.py document.md --output report.docx
   python markdown_to_docx.py document.md --no-table-borders
+  python markdown_to_docx.py document.md --table-border-color 000000
+  python markdown_to_docx.py document.md --table-border-color "128,128,128"
 
 Поддържани форматирания:
   **bold текст** - удебелен текст
@@ -466,13 +534,34 @@ def main():
         '--no-table-borders',
         action='store_true',
         default=False,
-        help='Скрива рамките на таблиците (по подразбиране рамките са черни)',
+        help='Скрива рамките на таблиците (по подразбиране рамките са видими)',
+    )
+
+    parser.add_argument(
+        '--table-border-color',
+        default=_TABLE_BORDER_COLOR,
+        metavar='COLOR',
+        help=(
+            'Цвят на рамките на таблиците – 6-цифрен hex (напр. 808080) '
+            'или R,G,B цели числа (напр. "128,128,128"). '
+            f'По подразбиране: {_TABLE_BORDER_COLOR} (RGB 128,128,128)'
+        ),
     )
 
     args = parser.parse_args()
 
+    try:
+        border_color = _parse_color(args.table_border_color)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # Конвертиране на файла
-    success = convert_file(args.input, args.output, table_borders=not args.no_table_borders)
+    success = convert_file(
+        args.input,
+        args.output,
+        table_borders=not args.no_table_borders,
+        table_border_color=border_color,
+    )
 
     # Връщане на статус код
     return 0 if success else 1

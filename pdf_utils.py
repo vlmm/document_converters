@@ -1,9 +1,10 @@
-"""Модул за комбиниране и разделяне на PDF файлове.
+"""Utilities for combining, splitting, and exporting PDF files as images.
 
-Поддържа:
-- Обединяване на множество PDF файлове в един
-- Разделяне на PDF файл по отделни страници или диапазони от страници
-- Използване от командния ред (merge / split подкоманди)
+Supports:
+- Merging multiple PDF files into one
+- Splitting a PDF file by individual pages or page ranges
+- Extracting PDF pages as PNG images
+- Command-line usage (merge / split / extract-images subcommands)
 """
 
 import argparse
@@ -18,39 +19,53 @@ except ImportError:  # pragma: no cover - clear message if dependency missing
     PdfReader = None  # type: ignore
     PdfWriter = None  # type: ignore
 
+try:
+    import fitz  # PyMuPDF  # type: ignore
+except ImportError:  # pragma: no cover
+    fitz = None  # type: ignore
+
 
 def _check_dependency() -> None:
-    """Проверява дали pypdf е инсталирано; хвърля RuntimeError ако не е."""
+    """Check that pypdf is installed; raise RuntimeError if it is not."""
     if PdfReader is None:
         raise RuntimeError(
-            "Липсваща зависимост: pypdf.\n"
-            "Инсталирайте я с: pip install pypdf"
+            "Missing dependency: pypdf.\n"
+            "Install it with: pip install pypdf"
+        )
+
+
+def _check_fitz_dependency() -> None:
+    """Check that PyMuPDF (fitz) is installed; raise RuntimeError if it is not."""
+    if fitz is None:  # pragma: no cover
+        raise RuntimeError(
+            "Missing dependency: PyMuPDF.\n"
+            "Install it with: pip install pymupdf"
         )
 
 
 def merge_pdfs(input_paths: List[Path], output_path: Path) -> Path:
-    """Обединява множество PDF файлове в един изходен файл.
+    """Merge multiple PDF files into a single output file.
 
     Args:
-        input_paths: Наредена последователност от пътища до входните PDF файлове.
-        output_path: Път до изходния PDF файл.
+        input_paths: Ordered sequence of paths to the input PDF files.
+        output_path: Path for the output PDF file.
 
     Returns:
-        Пътят до създадения изходен файл.
+        The path to the created output file.
 
     Raises:
-        RuntimeError: Ако pypdf не е инсталирано.
-        FileNotFoundError: Ако някой от входните файлове не съществува.
-        ValueError: Ако списъкът с входни файлове е празен.
+        RuntimeError: If pypdf is not installed.
+        FileNotFoundError: If any of the input files does not exist.
+        ValueError: If the list of input files is empty.
     """
     _check_dependency()
 
     if not input_paths:
-        raise ValueError("Необходим е поне един входен PDF файл.")
+        raise ValueError("At least one input PDF file is required.")
 
     for path in input_paths:
         if not path.exists():
-            raise FileNotFoundError(f"Входен файл не е намерен: {path}")
+            raise FileNotFoundError(f"Input file not found: {path}")
 
     writer = PdfWriter()
 
@@ -67,20 +82,20 @@ def merge_pdfs(input_paths: List[Path], output_path: Path) -> Path:
 
 
 def _parse_page_ranges(spec: str, total_pages: int) -> List[int]:
-    """Разбира низ с диапазони от страници и връща списък с 0-базирани индекси.
+    """Parse a page-range string and return a list of 0-based page indices.
 
-    Форматът е запетайно-разделени диапазони/единични номера (1-базирани).
-    Примери: ``"1"`` → [0], ``"1-3"`` → [0,1,2], ``"1,3-5"`` → [0,2,3,4].
+    The format is comma-separated ranges or individual page numbers (1-based).
+    Examples: ``"1"`` → [0], ``"1-3"`` → [0,1,2], ``"1,3-5"`` → [0,2,3,4].
 
     Args:
-        spec: Низ с диапазони (напр. ``"1-3,5,7-9"``).
-        total_pages: Общ брой на страниците в документа.
+        spec: Range string (e.g. ``"1-3,5,7-9"``).
+        total_pages: Total number of pages in the document.
 
     Returns:
-        Списък с уникални 0-базирани индекси на страниците, запазвайки реда.
+        List of unique 0-based page indices, preserving order.
 
     Raises:
-        ValueError: При невалиден формат или номера извън допустимия диапазон.
+        ValueError: On invalid format or page numbers outside the valid range.
     """
     indices: List[int] = []
     seen = set()
@@ -94,18 +109,18 @@ def _parse_page_ranges(spec: str, total_pages: int) -> List[int]:
                 start = int(bounds[0].strip())
                 end = int(bounds[1].strip())
             except ValueError:
-                raise ValueError(f"Невалиден диапазон от страници: '{part}'")
+                raise ValueError(f"Invalid page range: '{part}'")
             if start < 1 or end < 1:
                 raise ValueError(
-                    f"Номерата на страниците трябва да са положителни: '{part}'"
+                    f"Page numbers must be positive: '{part}'"
                 )
             if start > end:
                 raise ValueError(
-                    f"Началната страница трябва да е ≤ крайната: '{part}'"
+                    f"Start page must be <= end page: '{part}'"
                 )
             if end > total_pages:
                 raise ValueError(
-                    f"Страница {end} е извън документа ({total_pages} стр.)"
+                    f"Page {end} is beyond the document ({total_pages} pages)"
                 )
             for i in range(start - 1, end):
                 if i not in seen:
@@ -115,14 +130,14 @@ def _parse_page_ranges(spec: str, total_pages: int) -> List[int]:
             try:
                 page_num = int(part)
             except ValueError:
-                raise ValueError(f"Невалиден номер на страница: '{part}'")
+                raise ValueError(f"Invalid page number: '{part}'")
             if page_num < 1:
                 raise ValueError(
-                    f"Номерата на страниците трябва да са положителни: '{part}'"
+                    f"Page numbers must be positive: '{part}'"
                 )
             if page_num > total_pages:
                 raise ValueError(
-                    f"Страница {page_num} е извън документа ({total_pages} стр.)"
+                    f"Page {page_num} is beyond the document ({total_pages} pages)"
                 )
             if (page_num - 1) not in seen:
                 indices.append(page_num - 1)
@@ -135,31 +150,31 @@ def split_pdf(
     output_dir: Path,
     pages: Optional[str] = None,
 ) -> List[Path]:
-    """Разделя PDF файл по отделни страници или по зададени диапазони.
+    """Split a PDF file into individual pages or specified page ranges.
 
-    Когато ``pages`` не е зададен, всяка страница се записва в отделен файл
+    When ``pages`` is not provided, each page is written to a separate file
     (``<stem>_page_1.pdf``, ``<stem>_page_2.pdf``, …).
 
-    Когато ``pages`` е зададен, само зоните от там се извличат в *един* файл.
-    Форматът е запетайно-разделени диапазони (1-базирани), напр. ``"1-3,5"``.
+    When ``pages`` is provided, only those pages are extracted into *one* file.
+    The format is comma-separated ranges (1-based), e.g. ``"1-3,5"``.
 
     Args:
-        input_path: Път до входния PDF файл.
-        output_dir: Директория, в която да се запишат изходните файлове.
-        pages: По желание – диапазон от страници за извличане (напр. ``"2-4"``).
+        input_path: Path to the input PDF file.
+        output_dir: Directory where the output files will be written.
+        pages: Optional page-range string for selective extraction (e.g. ``"2-4"``).
 
     Returns:
-        Списък с пътища до всички създадени изходни файлове.
+        List of paths to all created output files.
 
     Raises:
-        RuntimeError: Ако pypdf не е инсталирано.
-        FileNotFoundError: Ако входният файл не съществува.
-        ValueError: При невалиден формат на страниците.
+        RuntimeError: If pypdf is not installed.
+        FileNotFoundError: If the input file does not exist.
+        ValueError: On invalid page-range format.
     """
     _check_dependency()
 
     if not input_path.exists():
-        raise FileNotFoundError(f"Входен файл не е намерен: {input_path}")
+        raise FileNotFoundError(f"Input file not found: {input_path}")
 
     reader = PdfReader(str(input_path))
     total_pages = len(reader.pages)
@@ -193,61 +208,153 @@ def split_pdf(
     return output_paths
 
 
+def extract_images_from_pdf(
+    input_path: Path,
+    output_dir: Path,
+    pages: Optional[str] = None,
+    dpi: int = 200,
+) -> List[Path]:
+    """Render PDF pages as PNG images.
+
+    Each selected page is saved as a separate PNG file named
+    ``<stem>_page_<N>.png`` where *N* is the 1-based page number within the
+    original document.
+
+    Args:
+        input_path: Path to the input PDF file.
+        output_dir: Directory where the PNG images will be written.
+        pages: Optional page-range string (e.g. ``"1-3,5"``).  When omitted,
+            all pages are exported.
+        dpi: Resolution for rendering (default: 200).
+
+    Returns:
+        List of paths to all created PNG files, in page order.
+
+    Raises:
+        RuntimeError: If PyMuPDF is not installed.
+        FileNotFoundError: If the input file does not exist.
+        ValueError: On invalid page-range format.
+    """
+    _check_fitz_dependency()
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = input_path.stem
+
+    doc = fitz.open(str(input_path))
+    total_pages = len(doc)
+
+    if pages is not None:
+        indices = _parse_page_ranges(pages, total_pages)
+    else:
+        indices = list(range(total_pages))
+
+    # Compute zoom factor from DPI (PDF default is 72 dpi)
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+
+    output_paths: List[Path] = []
+    for idx in indices:
+        page = doc[idx]
+        pixmap = page.get_pixmap(matrix=matrix)
+        out_file = output_dir / f"{stem}_page_{idx + 1}.png"
+        pixmap.save(str(out_file))
+        output_paths.append(out_file)
+
+    doc.close()
+    return output_paths
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    """Главна функция за командния ред.
+    """Main entry point for the command-line interface.
 
-    Поддържа две подкоманди:
+    Supports three subcommands:
 
-    * ``merge`` – обединява PDF файлове::
+    * ``merge`` – merge PDF files::
 
         pdf_utils.py merge -o combined.pdf file1.pdf file2.pdf
 
-    * ``split`` – разделя PDF файл::
+    * ``split`` – split a PDF file::
 
         pdf_utils.py split input.pdf -o output_dir/
         pdf_utils.py split input.pdf -o output_dir/ --pages 1-3,5
+
+    * ``extract-images`` – export PDF pages as PNG images::
+
+        pdf_utils.py extract-images input.pdf -o output_dir/
+        pdf_utils.py extract-images input.pdf -o output_dir/ --pages 1-3 --dpi 300
     """
     parser = argparse.ArgumentParser(
-        description="Комбиниране и разделяне на PDF файлове."
+        description="Combine, split, and export PDF files."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- merge subcommand ---
     merge_parser = subparsers.add_parser(
-        "merge", help="Обединява множество PDF файлове в един."
+        "merge", help="Merge multiple PDF files into one."
     )
     merge_parser.add_argument(
         "inputs",
         nargs="+",
         metavar="INPUT",
-        help="Входни PDF файлове (по ред).",
+        help="Input PDF files (in order).",
     )
     merge_parser.add_argument(
         "-o", "--output",
         required=True,
         metavar="OUTPUT",
-        help="Изходен PDF файл.",
+        help="Output PDF file.",
     )
 
     # --- split subcommand ---
     split_parser = subparsers.add_parser(
-        "split", help="Разделя PDF файл на отделни файлове."
+        "split", help="Split a PDF file into separate files."
     )
-    split_parser.add_argument("input", help="Входен PDF файл.")
+    split_parser.add_argument("input", help="Input PDF file.")
     split_parser.add_argument(
         "-o", "--output-dir",
         default=".",
         metavar="DIR",
-        help="Директория за изходните файлове (по подразбиране: текущата).",
+        help="Output directory (default: current directory).",
     )
     split_parser.add_argument(
         "--pages",
         default=None,
         metavar="RANGES",
         help=(
-            "Диапазони от страници за извличане (напр. '1-3,5'). "
-            "Ако не е зададено, всяка страница се записва поотделно."
+            "Page ranges to extract (e.g. '1-3,5'). "
+            "If not specified, every page is written to a separate file."
         ),
+    )
+
+    # --- extract-images subcommand ---
+    img_parser = subparsers.add_parser(
+        "extract-images", help="Export PDF pages as PNG images."
+    )
+    img_parser.add_argument("input", help="Input PDF file.")
+    img_parser.add_argument(
+        "-o", "--output-dir",
+        default=".",
+        metavar="DIR",
+        help="Output directory for PNG files (default: current directory).",
+    )
+    img_parser.add_argument(
+        "--pages",
+        default=None,
+        metavar="RANGES",
+        help=(
+            "Page ranges to export (e.g. '1-3,5'). "
+            "If not specified, all pages are exported."
+        ),
+    )
+    img_parser.add_argument(
+        "--dpi",
+        type=int,
+        default=200,
+        metavar="DPI",
+        help="Rendering resolution in DPI (default: 200).",
     )
 
     args = parser.parse_args(argv)
@@ -258,19 +365,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 [Path(p).expanduser().resolve() for p in args.inputs],
                 Path(args.output).expanduser().resolve(),
             )
-            print(f"Записан обединен PDF: {output}")
+            print(f"Saved merged PDF: {output}")
 
-        else:  # split
+        elif args.command == "split":
             outputs = split_pdf(
                 Path(args.input).expanduser().resolve(),
                 Path(args.output_dir).expanduser().resolve(),
                 pages=args.pages,
             )
             for out in outputs:
-                print(f"Записан: {out}")
+                print(f"Saved: {out}")
+
+        else:  # extract-images
+            outputs = extract_images_from_pdf(
+                Path(args.input).expanduser().resolve(),
+                Path(args.output_dir).expanduser().resolve(),
+                pages=args.pages,
+                dpi=args.dpi,
+            )
+            for out in outputs:
+                print(f"Saved: {out}")
 
     except Exception as exc:  # pragma: no cover - CLI error path
-        sys.stderr.write(f"Грешка: {exc}\n")
+        sys.stderr.write(f"Error: {exc}\n")
         return 1
 
     return 0

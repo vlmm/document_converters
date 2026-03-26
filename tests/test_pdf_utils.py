@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pypdf import PdfReader, PdfWriter
 
-from pdf_utils import _parse_page_ranges, merge_pdfs, split_pdf
+from pdf_utils import _parse_page_ranges, extract_images_from_pdf, merge_pdfs, split_pdf
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +248,124 @@ class TestMain(unittest.TestCase):
         self.assertEqual(len(parts), 1)
         reader = PdfReader(str(parts[0]))
         self.assertEqual(len(reader.pages), 2)
+
+
+
+
+# ---------------------------------------------------------------------------
+# extract_images_from_pdf
+# ---------------------------------------------------------------------------
+
+class TestExtractImagesFromPdf(unittest.TestCase):
+    """Integration tests for extract_images_from_pdf."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.src = _save_pdf(self.tmp, "source.pdf", 3)
+        self.out_dir = self.tmp / "images"
+
+    def test_extract_all_pages(self):
+        results = extract_images_from_pdf(self.src, self.out_dir)
+        self.assertEqual(len(results), 3)
+        for path in results:
+            self.assertTrue(path.exists())
+            self.assertEqual(path.suffix, ".png")
+
+    def test_extract_naming_convention(self):
+        results = extract_images_from_pdf(self.src, self.out_dir)
+        names = [p.name for p in results]
+        self.assertIn("source_page_1.png", names)
+        self.assertIn("source_page_3.png", names)
+
+    def test_extract_with_page_range(self):
+        results = extract_images_from_pdf(self.src, self.out_dir, pages="1-2")
+        self.assertEqual(len(results), 2)
+        names = [p.name for p in results]
+        self.assertIn("source_page_1.png", names)
+        self.assertIn("source_page_2.png", names)
+
+    def test_extract_single_page(self):
+        results = extract_images_from_pdf(self.src, self.out_dir, pages="2")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "source_page_2.png")
+
+    def test_extract_mixed_ranges(self):
+        results = extract_images_from_pdf(self.src, self.out_dir, pages="1,3")
+        self.assertEqual(len(results), 2)
+        names = [p.name for p in results]
+        self.assertIn("source_page_1.png", names)
+        self.assertIn("source_page_3.png", names)
+
+    def test_extract_creates_output_directory(self):
+        nested = self.tmp / "deep" / "nested"
+        extract_images_from_pdf(self.src, nested)
+        self.assertTrue(nested.exists())
+
+    def test_extract_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            extract_images_from_pdf(self.tmp / "missing.pdf", self.out_dir)
+
+    def test_extract_invalid_pages_raises(self):
+        with self.assertRaises(ValueError):
+            extract_images_from_pdf(self.src, self.out_dir, pages="0")
+
+    def test_extract_page_out_of_range_raises(self):
+        with self.assertRaises(ValueError):
+            extract_images_from_pdf(self.src, self.out_dir, pages="10")
+
+    def test_extract_custom_dpi(self):
+        """Higher DPI should produce a larger image (more pixels) than lower DPI."""
+        from PIL import Image
+        results_low = extract_images_from_pdf(self.src, self.out_dir / "low", pages="1", dpi=72)
+        results_high = extract_images_from_pdf(self.src, self.out_dir / "high", pages="1", dpi=144)
+        with Image.open(results_low[0]) as img_low:
+            w_low, h_low = img_low.size
+        with Image.open(results_high[0]) as img_high:
+            w_high, h_high = img_high.size
+        # 144 DPI is exactly 2× 72 DPI, so pixel dimensions should also double
+        self.assertEqual(w_high, w_low * 2)
+        self.assertEqual(h_high, h_low * 2)
+
+
+# ---------------------------------------------------------------------------
+# CLI (main) – extract-images subcommand
+# ---------------------------------------------------------------------------
+
+class TestMainExtractImages(unittest.TestCase):
+    """Tests for the extract-images CLI subcommand."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_extract_images_cli_all_pages(self):
+        from pdf_utils import main
+        src = _save_pdf(self.tmp, "doc.pdf", 3)
+        out_dir = str(self.tmp / "imgs")
+        rc = main(["extract-images", str(src), "-o", out_dir])
+        self.assertEqual(rc, 0)
+        parts = list(Path(out_dir).glob("*.png"))
+        self.assertEqual(len(parts), 3)
+
+    def test_extract_images_cli_with_pages(self):
+        from pdf_utils import main
+        src = _save_pdf(self.tmp, "doc2.pdf", 5)
+        out_dir = str(self.tmp / "imgs_pages")
+        rc = main(["extract-images", str(src), "-o", out_dir, "--pages", "2-4"])
+        self.assertEqual(rc, 0)
+        parts = sorted(Path(out_dir).glob("*.png"))
+        self.assertEqual(len(parts), 3)
+        names = [p.name for p in parts]
+        self.assertIn("doc2_page_2.png", names)
+        self.assertIn("doc2_page_4.png", names)
+
+    def test_extract_images_cli_with_dpi(self):
+        from pdf_utils import main
+        src = _save_pdf(self.tmp, "doc3.pdf", 1)
+        out_dir = str(self.tmp / "imgs_dpi")
+        rc = main(["extract-images", str(src), "-o", out_dir, "--dpi", "144"])
+        self.assertEqual(rc, 0)
+        parts = list(Path(out_dir).glob("*.png"))
+        self.assertEqual(len(parts), 1)
 
 
 if __name__ == "__main__":

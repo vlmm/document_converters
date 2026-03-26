@@ -17,13 +17,18 @@ _TABLE_SEPARATOR_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
 )
 
+# Border width (in eighths of a point) and spacing used for table borders.
+_TABLE_BORDER_SZ = 4
+_TABLE_BORDER_SPACE = 0
+
 
 class MarkdownToDocx:
-    def __init__(self):
+    def __init__(self, table_borders: bool = True):
         self.doc = Document()
         self.in_code_block = False
         self.code_block_lines = []
         self.table_buffer: List[str] = []
+        self.table_borders = table_borders
 
     def convert(self, markdown_text: str) -> Document:
         """Конвертира markdown текст в DOCX документ"""
@@ -105,9 +110,11 @@ class MarkdownToDocx:
             return True
         if s.startswith('|') or s.endswith('|'):
             return True
-        # A single unescaped pipe is sufficient: without-outer-pipe tables like
-        # "A | B" have exactly one pipe. False positives are handled by
-        # _flush_table, which falls back to paragraphs when no separator follows.
+        # A single pipe is enough to detect tables without outer delimiters
+        # (e.g. "A | B" produces a 2-column table with one pipe).
+        # The fallback in _flush_table returns early and renders lines as
+        # ordinary paragraphs when the second buffered line is not a valid
+        # separator, so false positives (prose containing a lone "|") are safe.
         return s.count('|') >= 1
 
     @staticmethod
@@ -195,6 +202,7 @@ class MarkdownToDocx:
         }
 
         table = self.doc.add_table(rows=len(all_rows), cols=num_cols)
+        self._set_table_borders(table, self.table_borders)
 
         for r_idx, row_cells in enumerate(all_rows):
             # Pad short rows
@@ -210,6 +218,38 @@ class MarkdownToDocx:
                     alignments[c_idx] if c_idx < len(alignments) else 'left',
                     WD_PARAGRAPH_ALIGNMENT.LEFT,
                 )
+
+    @staticmethod
+    def _set_table_borders(table, visible: bool):
+        """Apply black single-line borders (visible=True) or no borders (visible=False)."""
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import qn
+
+        ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        if visible:
+            b = (f'w:val="single" w:sz="{_TABLE_BORDER_SZ}" '
+                 f'w:space="{_TABLE_BORDER_SPACE}" w:color="000000"')
+        else:
+            b = (f'w:val="none" w:sz="0" '
+                 f'w:space="{_TABLE_BORDER_SPACE}" w:color="auto"')
+
+        borders_xml = (
+            f'<w:tblBorders {ns}>'
+            f'<w:top {b}/><w:left {b}/><w:bottom {b}/>'
+            f'<w:right {b}/><w:insideH {b}/><w:insideV {b}/>'
+            f'</w:tblBorders>'
+        )
+        borders_elm = parse_xml(borders_xml)
+
+        tblPr = table._element.find(qn('w:tblPr'))
+        if tblPr is None:
+            tblPr = parse_xml(f'<w:tblPr {ns}/>')
+            table._element.insert(0, tblPr)
+
+        existing = tblPr.find(qn('w:tblBorders'))
+        if existing is not None:
+            tblPr.remove(existing)
+        tblPr.append(borders_elm)
 
     def _add_heading(self, text: str, level: int):
         """Добавя заглавие"""
@@ -342,14 +382,14 @@ class MarkdownToDocx:
         self.doc.save(filename)
 
 
-def markdown_to_docx(markdown_text: str, output_filename: str):
+def markdown_to_docx(markdown_text: str, output_filename: str, table_borders: bool = True):
     """Простна функция за конвертиране на markdown в docx"""
-    converter = MarkdownToDocx()
+    converter = MarkdownToDocx(table_borders=table_borders)
     doc = converter.convert(markdown_text)
     converter.save(output_filename)
 
 
-def convert_file(input_file: str, output_file: str = None):
+def convert_file(input_file: str, output_file: str = None, table_borders: bool = True):
     """Конвертира markdown файл в docx файл"""
 
     # Проверка дали входния файл съществува
@@ -375,7 +415,7 @@ def convert_file(input_file: str, output_file: str = None):
 
         # Конвертиране
         print(f"⏳ Конвертиране на markdown в docx...")
-        markdown_to_docx(markdown_content, output_file)
+        markdown_to_docx(markdown_content, output_file, table_borders=table_borders)
 
         print(f"✅ Успешно! Документ създаден: {output_file}")
         return True
@@ -395,6 +435,7 @@ def main():
   python markdown_to_docx.py README.md
   python markdown_to_docx.py README.md -o output.docx
   python markdown_to_docx.py document.md --output report.docx
+  python markdown_to_docx.py document.md --no-table-borders
 
 Поддържани форматирания:
   **bold текст** - удебелен текст
@@ -421,10 +462,17 @@ def main():
         version='%(prog)s 1.0'
     )
 
+    parser.add_argument(
+        '--no-table-borders',
+        action='store_true',
+        default=False,
+        help='Скрива рамките на таблиците (по подразбиране рамките са черни)',
+    )
+
     args = parser.parse_args()
 
     # Конвертиране на файла
-    success = convert_file(args.input, args.output)
+    success = convert_file(args.input, args.output, table_borders=not args.no_table_borders)
 
     # Връщане на статус код
     return 0 if success else 1

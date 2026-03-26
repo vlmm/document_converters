@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from markdown_to_docx import MarkdownToDocx
 
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.oxml.ns import qn
 
 
 def _convert(md: str):
@@ -200,6 +201,56 @@ class TestTableDoesNotBreakOtherElements(unittest.TestCase):
         md = "| X | Y |\n|---|---|\n| 1 | 2 |"
         doc = _convert(md)
         self.assertEqual(len(_tables(doc)), 1)
+
+
+class TestTableBorders(unittest.TestCase):
+    TABLE = "| A | B |\n|---|---|\n| 1 | 2 |"
+
+    def _get_tbl_borders(self, doc):
+        table = doc.tables[0]
+        tblPr = table._element.find(qn('w:tblPr'))
+        if tblPr is None:
+            return None
+        return tblPr.find(qn('w:tblBorders'))
+
+    def test_default_borders_are_black(self):
+        """By default (table_borders=True) the table must have black single-line borders."""
+        converter = MarkdownToDocx(table_borders=True)
+        doc = converter.convert(self.TABLE)
+        borders = self._get_tbl_borders(doc)
+        self.assertIsNotNone(borders, "w:tblBorders element must be present")
+        top = borders.find(qn('w:top'))
+        self.assertIsNotNone(top)
+        self.assertEqual(top.get(qn('w:val')), 'single')
+        self.assertEqual(top.get(qn('w:color')).upper(), '000000')
+
+    def test_no_borders_flag_removes_visible_borders(self):
+        """With table_borders=False every border side must be 'none'."""
+        converter = MarkdownToDocx(table_borders=False)
+        doc = converter.convert(self.TABLE)
+        borders = self._get_tbl_borders(doc)
+        self.assertIsNotNone(borders, "w:tblBorders element must still be present")
+        for side in ('w:top', 'w:left', 'w:bottom', 'w:right', 'w:insideH', 'w:insideV'):
+            el = borders.find(qn(side))
+            self.assertIsNotNone(el, f"{side} must be present")
+            self.assertEqual(el.get(qn('w:val')), 'none', f"{side} must be 'none'")
+
+    def test_all_six_border_sides_present_when_visible(self):
+        """All six border directions must be set when borders are visible."""
+        converter = MarkdownToDocx(table_borders=True)
+        doc = converter.convert(self.TABLE)
+        borders = self._get_tbl_borders(doc)
+        for side in ('w:top', 'w:left', 'w:bottom', 'w:right', 'w:insideH', 'w:insideV'):
+            self.assertIsNotNone(borders.find(qn(side)), f"{side} must be present")
+
+    def test_default_constructor_has_borders(self):
+        """MarkdownToDocx() with no arguments defaults to table_borders=True."""
+        converter = MarkdownToDocx()
+        doc = converter.convert(self.TABLE)
+        borders = self._get_tbl_borders(doc)
+        self.assertIsNotNone(borders)
+        top = borders.find(qn('w:top'))
+        self.assertEqual(top.get(qn('w:val')), 'single')
 
 
 if __name__ == "__main__":

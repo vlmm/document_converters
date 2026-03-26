@@ -598,7 +598,7 @@ class TestMain(unittest.TestCase):
             [{"texts": [(72, 100, "CLI test", 12)]}],
         )
         out_path = self.tmp / "cli.md"
-        rc = main([str(pdf_path), str(out_path), "--extract-images", "false" if False else "--no-extract-images"])
+        rc = main([str(pdf_path), str(out_path), "--no-extract-images"])
         self.assertEqual(rc, 0)
         self.assertTrue(out_path.exists())
         self.assertIn("CLI test", out_path.read_text(encoding="utf-8"))

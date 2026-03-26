@@ -26,8 +26,8 @@ from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 try:
     import fitz  # PyMuPDF
-    _FITZ_BOLD = fitz.TEXT_FONT_BOLD      # 16
-    _FITZ_ITALIC = fitz.TEXT_FONT_ITALIC  # 2
+    _FITZ_BOLD = fitz.TEXT_FONT_BOLD      # bold font flag
+    _FITZ_ITALIC = fitz.TEXT_FONT_ITALIC  # italic font flag
 except ImportError:  # pragma: no cover
     fitz = None  # type: ignore
     _FITZ_BOLD = 16
@@ -56,6 +56,18 @@ LayoutMode = Literal["auto", "pymupdf", "ocr"]
 TableMode = Literal["auto", "html", "markdown", "off"]
 
 # ---------------------------------------------------------------------------
+# Layout heuristic constants
+# ---------------------------------------------------------------------------
+
+# Minimum fraction of a span's width that a horizontal drawing line must
+# overlap before it is considered an underline or strikethrough candidate.
+_UNDERLINE_OVERLAP_THRESHOLD = 0.30
+
+# A text block whose width exceeds this fraction of the page width is treated
+# as a "full-width" block (e.g. a heading or caption) rather than a column
+# block.
+_FULL_WIDTH_BLOCK_RATIO = 0.60
+
 # Heading heuristics: font-size ratio relative to median body text
 # ---------------------------------------------------------------------------
 _HEADING_SCALES: List[Tuple[float, int]] = [
@@ -311,7 +323,7 @@ def _detect_marks(
                 ly = (p1.y + p2.y) / 2
                 # Require at least 30 % horizontal overlap with the span
                 x_overlap = min(x1, lx1) - max(x0, lx0)
-                if x_overlap < span_width * 0.30:
+                if x_overlap < span_width * _UNDERLINE_OVERLAP_THRESHOLD:
                     continue
                 rel_y = (ly - y0) / span_height
                 if rel_y > 0.80:
@@ -436,7 +448,7 @@ def _detect_columns(text_blocks: list, page_width: float) -> int:
     for block in text_blocks:
         x0, _y0, x1, _y1 = block["bbox"]
         block_width = x1 - x0
-        if block_width > page_width * 0.60:
+        if block_width > page_width * _FULL_WIDTH_BLOCK_RATIO:
             spanning_count += 1
             continue
         center_x = (x0 + x1) / 2
@@ -479,7 +491,7 @@ def _sort_blocks_reading_order(
     for block in blocks:
         x0, _y0, x1, _y1 = block["bbox"]
         bw = x1 - x0
-        if bw > page_width * 0.60:
+        if bw > page_width * _FULL_WIDTH_BLOCK_RATIO:
             full_width.append(block)
         elif (x0 + x1) / 2 < mid:
             left_col.append(block)

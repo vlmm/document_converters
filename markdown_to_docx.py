@@ -13,11 +13,17 @@ from pathlib import Path
 from typing import List, Tuple
 
 
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+
+
 class MarkdownToDocx:
     def __init__(self):
         self.doc = Document()
         self.in_code_block = False
         self.code_block_lines = []
+        self.table_buffer: List[str] = []
 
     def convert(self, markdown_text: str) -> Document:
         """Конвертира markdown текст в DOCX документ"""
@@ -26,7 +32,8 @@ class MarkdownToDocx:
         for line in lines:
             self._process_line(line)
 
-        # Добавяне на остатъчни редове от code блок
+        # Flush pending table and code block at EOF
+        self._flush_table()
         if self.in_code_block:
             self._add_code_block()
 
@@ -35,8 +42,9 @@ class MarkdownToDocx:
     def _process_line(self, line: str):
         """Обработва един ред от markdown"""
 
-        # Code блокове
+        # Code блокове (highest priority – flush table first)
         if line.strip().startswith('```'):
+            self._flush_table()
             if not self.in_code_block:
                 self.in_code_block = True
                 self.code_block_lines = []
@@ -48,6 +56,14 @@ class MarkdownToDocx:
         if self.in_code_block:
             self.code_block_lines.append(line)
             return
+
+        # Таблични редове – буферират се
+        if self._is_table_line(line):
+            self.table_buffer.append(line)
+            return
+
+        # Не-таблично съдържание – изтриваме буфера
+        self._flush_table()
 
         # Пропускане на празни редове
         if not line.strip():
@@ -74,6 +90,126 @@ class MarkdownToDocx:
         # Обикновен текст с форматиране
         else:
             self._add_paragraph_with_formatting(line)
+
+    # ------------------------------------------------------------------
+    # Table helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        """Return True if *line* looks like part of a Markdown pipe table."""
+        s = line.strip()
+        if '|' not in s:
+            return False
+        if bool(_TABLE_SEPARATOR_RE.match(s)):
+            return True
+        if s.startswith('|') or s.endswith('|'):
+            return True
+        # A single unescaped pipe is sufficient: without-outer-pipe tables like
+        # "A | B" have exactly one pipe. False positives are handled by
+        # _flush_table, which falls back to paragraphs when no separator follows.
+        return s.count('|') >= 1
+
+    @staticmethod
+    def _is_separator_line(line: str) -> bool:
+        return bool(_TABLE_SEPARATOR_RE.match(line.strip()))
+
+    @staticmethod
+    def _split_table_cells(line: str) -> List[str]:
+        """Split a table row into individual cell strings.
+
+        Handles:
+        - leading/trailing pipes
+        - escaped pipes (``\\|``) inside cell content
+        """
+        s = line.strip()
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|') and not s.endswith('\\|'):
+            s = s[:-1]
+        # Split on unescaped pipes
+        cells = re.split(r'(?<!\\)\|', s)
+        return [c.strip().replace('\\|', '|') for c in cells]
+
+    @staticmethod
+    def _parse_alignments(separator_line: str) -> List[str]:
+        """Return a list of alignment strings ('left', 'right', 'center')
+        derived from a Markdown table separator row."""
+        s = separator_line.strip()
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|'):
+            s = s[:-1]
+        alignments = []
+        for cell in s.split('|'):
+            cell = cell.strip()
+            if cell.startswith(':') and cell.endswith(':'):
+                alignments.append('center')
+            elif cell.endswith(':'):
+                alignments.append('right')
+            else:
+                alignments.append('left')
+        return alignments
+
+    def _flush_table(self):
+        """Convert any buffered table lines into a DOCX table, then clear the buffer."""
+        if not self.table_buffer:
+            return
+
+        lines = self.table_buffer
+        self.table_buffer = []
+
+        # Validate: need header + separator as the first two lines
+        if len(lines) < 2 or not self._is_separator_line(lines[1]):
+            # Not a valid Markdown table – render as ordinary paragraphs
+            for line in lines:
+                if line.strip():
+                    self._add_paragraph_with_formatting(line)
+            return
+
+        self._add_docx_table(lines)
+
+    def _add_docx_table(self, lines: List[str]):
+        """Build a python-docx table from a list of raw Markdown table lines."""
+        alignments = self._parse_alignments(lines[1])
+
+        # Data rows: skip the separator (index 1)
+        data_lines = [lines[0]] + lines[2:]
+        all_rows = [self._split_table_cells(l) for l in data_lines]
+
+        if not all_rows:
+            return
+
+        num_cols = max(len(row) for row in all_rows)
+        if num_cols == 0:
+            return
+
+        # Pad alignments list to num_cols
+        while len(alignments) < num_cols:
+            alignments.append('left')
+
+        _align_map = {
+            'left': WD_PARAGRAPH_ALIGNMENT.LEFT,
+            'right': WD_PARAGRAPH_ALIGNMENT.RIGHT,
+            'center': WD_PARAGRAPH_ALIGNMENT.CENTER,
+        }
+
+        table = self.doc.add_table(rows=len(all_rows), cols=num_cols)
+
+        for r_idx, row_cells in enumerate(all_rows):
+            # Pad short rows
+            while len(row_cells) < num_cols:
+                row_cells.append('')
+            for c_idx in range(num_cols):
+                cell = table.cell(r_idx, c_idx)
+                para = cell.paragraphs[0]
+                run = para.add_run(row_cells[c_idx])
+                if r_idx == 0:
+                    run.bold = True
+                para.alignment = _align_map.get(
+                    alignments[c_idx] if c_idx < len(alignments) else 'left',
+                    WD_PARAGRAPH_ALIGNMENT.LEFT,
+                )
 
     def _add_heading(self, text: str, level: int):
         """Добавя заглавие"""

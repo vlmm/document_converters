@@ -13,11 +13,48 @@ from pathlib import Path
 from typing import List, Tuple
 
 
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+
+# Border width (in eighths of a point), spacing, and default color for table borders.
+_TABLE_BORDER_SZ = 4
+_TABLE_BORDER_SPACE = 0
+_TABLE_BORDER_COLOR = "808080"  # RGB 128, 128, 128
+
+
+def _parse_color(color_str: str) -> str:
+    """Parse *color_str* to a 6-character uppercase hex string (e.g. ``'808080'``).
+
+    Accepted formats:
+    - Hex string: ``'808080'`` or ``'#808080'``
+    - RGB triple: ``'128,128,128'``
+    """
+    s = color_str.strip().lstrip('#')
+    if ',' in s:
+        parts = s.split(',')
+        if len(parts) != 3:
+            raise ValueError(f"Invalid RGB color '{color_str}': expected 3 comma-separated integers")
+        r, g, b = (int(p.strip()) for p in parts)
+        for name, val in (('R', r), ('G', g), ('B', b)):
+            if not 0 <= val <= 255:
+                raise ValueError(f"RGB component {name}={val} out of range 0-255")
+        return f"{r:02X}{g:02X}{b:02X}"
+    if len(s) == 6 and all(c in '0123456789abcdefABCDEF' for c in s):
+        return s.upper()
+    raise ValueError(
+        f"Invalid color '{color_str}': use a 6-digit hex string or 'R,G,B' integers"
+    )
+
+
 class MarkdownToDocx:
-    def __init__(self):
+    def __init__(self, table_borders: bool = True, table_border_color: str = _TABLE_BORDER_COLOR):
         self.doc = Document()
         self.in_code_block = False
         self.code_block_lines = []
+        self.table_buffer: List[str] = []
+        self.table_borders = table_borders
+        self.table_border_color = _parse_color(table_border_color)
 
     def convert(self, markdown_text: str) -> Document:
         """Конвертира markdown текст в DOCX документ"""
@@ -26,7 +63,8 @@ class MarkdownToDocx:
         for line in lines:
             self._process_line(line)
 
-        # Добавяне на остатъчни редове от code блок
+        # Flush pending table and code block at EOF
+        self._flush_table()
         if self.in_code_block:
             self._add_code_block()
 
@@ -35,8 +73,9 @@ class MarkdownToDocx:
     def _process_line(self, line: str):
         """Обработва един ред от markdown"""
 
-        # Code блокове
+        # Code блокове (highest priority – flush table first)
         if line.strip().startswith('```'):
+            self._flush_table()
             if not self.in_code_block:
                 self.in_code_block = True
                 self.code_block_lines = []
@@ -48,6 +87,14 @@ class MarkdownToDocx:
         if self.in_code_block:
             self.code_block_lines.append(line)
             return
+
+        # Таблични редове – буферират се
+        if self._is_table_line(line):
+            self.table_buffer.append(line)
+            return
+
+        # Не-таблично съдържание – изтриваме буфера
+        self._flush_table()
 
         # Пропускане на празни редове
         if not line.strip():
@@ -74,6 +121,195 @@ class MarkdownToDocx:
         # Обикновен текст с форматиране
         else:
             self._add_paragraph_with_formatting(line)
+
+    # ------------------------------------------------------------------
+    # Table helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        """Return True if *line* looks like part of a Markdown pipe table."""
+        s = line.strip()
+        if '|' not in s:
+            return False
+        if bool(_TABLE_SEPARATOR_RE.match(s)):
+            return True
+        if s.startswith('|') or s.endswith('|'):
+            return True
+        # A single pipe is enough to detect tables without outer delimiters
+        # (e.g. "A | B" produces a 2-column table with one pipe).
+        # The fallback in _flush_table returns early and renders lines as
+        # ordinary paragraphs when the second buffered line is not a valid
+        # separator, so false positives (prose containing a lone "|") are safe.
+        return s.count('|') >= 1
+
+    @staticmethod
+    def _is_separator_line(line: str) -> bool:
+        return bool(_TABLE_SEPARATOR_RE.match(line.strip()))
+
+    @staticmethod
+    def _split_table_cells(line: str) -> List[str]:
+        """Split a table row into individual cell strings.
+
+        Handles:
+        - leading/trailing pipes
+        - escaped pipes (``\\|``) inside cell content
+        """
+        s = line.strip()
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|') and not s.endswith('\\|'):
+            s = s[:-1]
+        # Split on unescaped pipes
+        cells = re.split(r'(?<!\\)\|', s)
+        return [c.strip().replace('\\|', '|') for c in cells]
+
+    @staticmethod
+    def _parse_alignments(separator_line: str) -> List[str]:
+        """Return a list of alignment strings ('left', 'right', 'center')
+        derived from a Markdown table separator row."""
+        s = separator_line.strip()
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|'):
+            s = s[:-1]
+        alignments = []
+        for cell in s.split('|'):
+            cell = cell.strip()
+            if cell.startswith(':') and cell.endswith(':'):
+                alignments.append('center')
+            elif cell.endswith(':'):
+                alignments.append('right')
+            else:
+                alignments.append('left')
+        return alignments
+
+    def _flush_table(self):
+        """Convert any buffered table lines into a DOCX table, then clear the buffer."""
+        if not self.table_buffer:
+            return
+
+        lines = self.table_buffer
+        self.table_buffer = []
+
+        # Validate: need header + separator as the first two lines
+        if len(lines) < 2 or not self._is_separator_line(lines[1]):
+            # Not a valid Markdown table – render as ordinary paragraphs
+            for line in lines:
+                if line.strip():
+                    self._add_paragraph_with_formatting(line)
+            return
+
+        self._add_docx_table(lines)
+
+    def _add_docx_table(self, lines: List[str]):
+        """Build a python-docx table from a list of raw Markdown table lines."""
+        alignments = self._parse_alignments(lines[1])
+
+        # Data rows: skip the separator (index 1)
+        data_lines = [lines[0]] + lines[2:]
+        all_rows = [self._split_table_cells(l) for l in data_lines]
+
+        if not all_rows:
+            return
+
+        num_cols = max(len(row) for row in all_rows)
+        if num_cols == 0:
+            return
+
+        # Pad alignments list to num_cols
+        while len(alignments) < num_cols:
+            alignments.append('left')
+
+        _align_map = {
+            'left': WD_PARAGRAPH_ALIGNMENT.LEFT,
+            'right': WD_PARAGRAPH_ALIGNMENT.RIGHT,
+            'center': WD_PARAGRAPH_ALIGNMENT.CENTER,
+        }
+
+        table = self.doc.add_table(rows=len(all_rows), cols=num_cols)
+        self._remove_preferred_widths(table)
+        self._set_table_borders(table, self.table_borders, self.table_border_color)
+
+        for r_idx, row_cells in enumerate(all_rows):
+            # Pad short rows
+            while len(row_cells) < num_cols:
+                row_cells.append('')
+            for c_idx in range(num_cols):
+                cell = table.cell(r_idx, c_idx)
+                para = cell.paragraphs[0]
+                run = para.add_run(row_cells[c_idx])
+                if r_idx == 0:
+                    run.bold = True
+                para.alignment = _align_map.get(
+                    alignments[c_idx] if c_idx < len(alignments) else 'left',
+                    WD_PARAGRAPH_ALIGNMENT.LEFT,
+                )
+
+    @staticmethod
+    def _set_table_borders(table, visible: bool, color: str = _TABLE_BORDER_COLOR):
+        """Apply single-line borders in *color* (visible=True) or no borders (visible=False)."""
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import qn
+
+        ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        if visible:
+            b = (f'w:val="single" w:sz="{_TABLE_BORDER_SZ}" '
+                 f'w:space="{_TABLE_BORDER_SPACE}" w:color="{color}"')
+        else:
+            b = (f'w:val="none" w:sz="0" '
+                 f'w:space="{_TABLE_BORDER_SPACE}" w:color="auto"')
+
+        borders_xml = (
+            f'<w:tblBorders {ns}>'
+            f'<w:top {b}/><w:left {b}/><w:bottom {b}/>'
+            f'<w:right {b}/><w:insideH {b}/><w:insideV {b}/>'
+            f'</w:tblBorders>'
+        )
+        borders_elm = parse_xml(borders_xml)
+
+        tblPr = table._element.find(qn('w:tblPr'))
+        if tblPr is None:
+            tblPr = parse_xml(f'<w:tblPr {ns}/>')
+            table._element.insert(0, tblPr)
+
+        existing = tblPr.find(qn('w:tblBorders'))
+        if existing is not None:
+            tblPr.remove(existing)
+        tblPr.append(borders_elm)
+
+    @staticmethod
+    def _remove_preferred_widths(table):
+        """Remove table-level, column-level and cell-level preferred-width settings.
+
+        python-docx may write ``w:tblW`` on the table properties, ``w:w`` on
+        each ``w:gridCol``, and ``w:tcW`` on each cell's ``w:tcPr``.  Removing
+        these lets Word calculate column widths automatically.
+        """
+        from docx.oxml.ns import qn
+
+        # Table preferred width
+        tblPr = table._element.find(qn('w:tblPr'))
+        if tblPr is not None:
+            tblW = tblPr.find(qn('w:tblW'))
+            if tblW is not None:
+                tblPr.remove(tblW)
+
+        # Column preferred widths in tblGrid
+        tblGrid = table._element.find(qn('w:tblGrid'))
+        if tblGrid is not None:
+            for gridCol in tblGrid.findall(qn('w:gridCol')):
+                attrib_key = qn('w:w')
+                if attrib_key in gridCol.attrib:
+                    del gridCol.attrib[attrib_key]
+
+        # Cell preferred widths
+        for tc in table._element.iter(qn('w:tc')):
+            tcPr = tc.find(qn('w:tcPr'))
+            if tcPr is not None:
+                tcW = tcPr.find(qn('w:tcW'))
+                if tcW is not None:
+                    tcPr.remove(tcW)
 
     def _add_heading(self, text: str, level: int):
         """Добавя заглавие"""
@@ -206,14 +442,18 @@ class MarkdownToDocx:
         self.doc.save(filename)
 
 
-def markdown_to_docx(markdown_text: str, output_filename: str):
+def markdown_to_docx(markdown_text: str, output_filename: str,
+                     table_borders: bool = True,
+                     table_border_color: str = _TABLE_BORDER_COLOR):
     """Простна функция за конвертиране на markdown в docx"""
-    converter = MarkdownToDocx()
+    converter = MarkdownToDocx(table_borders=table_borders, table_border_color=table_border_color)
     doc = converter.convert(markdown_text)
     converter.save(output_filename)
 
 
-def convert_file(input_file: str, output_file: str = None):
+def convert_file(input_file: str, output_file: str = None,
+                 table_borders: bool = True,
+                 table_border_color: str = _TABLE_BORDER_COLOR):
     """Конвертира markdown файл в docx файл"""
 
     # Проверка дали входния файл съществува
@@ -239,7 +479,9 @@ def convert_file(input_file: str, output_file: str = None):
 
         # Конвертиране
         print(f"⏳ Конвертиране на markdown в docx...")
-        markdown_to_docx(markdown_content, output_file)
+        markdown_to_docx(markdown_content, output_file,
+                         table_borders=table_borders,
+                         table_border_color=table_border_color)
 
         print(f"✅ Успешно! Документ създаден: {output_file}")
         return True
@@ -259,6 +501,9 @@ def main():
   python markdown_to_docx.py README.md
   python markdown_to_docx.py README.md -o output.docx
   python markdown_to_docx.py document.md --output report.docx
+  python markdown_to_docx.py document.md --no-table-borders
+  python markdown_to_docx.py document.md --table-border-color 000000
+  python markdown_to_docx.py document.md --table-border-color "128,128,128"
 
 Поддържани форматирания:
   **bold текст** - удебелен текст
@@ -285,10 +530,38 @@ def main():
         version='%(prog)s 1.0'
     )
 
+    parser.add_argument(
+        '--no-table-borders',
+        action='store_true',
+        default=False,
+        help='Скрива рамките на таблиците (по подразбиране рамките са видими)',
+    )
+
+    parser.add_argument(
+        '--table-border-color',
+        default=_TABLE_BORDER_COLOR,
+        metavar='COLOR',
+        help=(
+            'Цвят на рамките на таблиците – 6-цифрен hex (напр. 808080) '
+            'или R,G,B цели числа (напр. "128,128,128"). '
+            f'По подразбиране: {_TABLE_BORDER_COLOR} (RGB 128,128,128)'
+        ),
+    )
+
     args = parser.parse_args()
 
+    try:
+        border_color = _parse_color(args.table_border_color)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # Конвертиране на файла
-    success = convert_file(args.input, args.output)
+    success = convert_file(
+        args.input,
+        args.output,
+        table_borders=not args.no_table_borders,
+        table_border_color=border_color,
+    )
 
     # Връщане на статус код
     return 0 if success else 1

@@ -76,8 +76,7 @@ Metadata (JSON) — машинно-четим, AI може да обновява
 
 import logging
 import os
-import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -169,7 +168,7 @@ mcp = FastMCP(APP_META["app_name"])
 # Utilities
 # -------------------------
 def now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # -------------------------
